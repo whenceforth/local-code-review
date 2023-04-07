@@ -45,7 +45,6 @@ works for cleaning up in this case.
    - The token should be stored in the same folder as the scripts, with the name `.ghub_oauth_pr_review`
    - `.gitignore` includes an entry for `.ghub_oauth*` to help insure the file is not
        committed to this repo.
-   - The format of the file should be `ghub_oauth=your-token-here`
 
 ## Configuration
 As mentioned above, you must provide a `.ghub_oauth_pr_review` file with a GitHub 
