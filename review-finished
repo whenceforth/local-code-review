@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+
+# Discards all changes from TEMP_BRANCH and deletes it.
+# Checks out RESTORE_BRANCH and pulls latest.
+# Args:
+# 1. RESTORE_BRANCH (optional, defaults to the default branch name for the repo)
+# 2. TEMP_BRANCH (optional, defaults to 'review')
+#
+# environment variables consulted:
+# REMEMBERED_BRANCH (which codereview sets)
+# 	if set is used to select the branch to return to 
+# 	if not set, we use the default branch name for the repo
+
+#  uncomment for verbose echoing of everything happening
+#set -o xtrace
+
+DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+"${DIR}/codereview" finished "$@"

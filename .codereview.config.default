@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+
+scratch_dir="${HOME}/.tmp/codereview"
+
+DEFAULT_TARGET_BRANCH="master"
+DEFAULT_TEMP_BRANCH="review"
+
+SCRATCH_DIR="${HOME}/.tmp/codereview"
