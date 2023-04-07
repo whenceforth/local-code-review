@@ -1,7 +1,7 @@
 # Code Review Scripts
 
 ## Motivation
-When I review code, in addition to viewing the diffs, I like to navigate around in the 
+When I review code, in addition to viewing the diffs on GitHub, I like to navigate around in the 
 changed codebase to explore the ramifications of those changes and look at related 
 code. This helps me understand the context and ask better questions. I find it's 
 easiest to do that if I can bring the proposed changes into my local development 
