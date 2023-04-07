@@ -12,8 +12,24 @@ else
   echo "using default config only"
 fi
 
+function debug {
+  if [ "${CR_LOG_DEBUG}" = "1" ] || [ "${CR_LOG_INFO}" = "1" ]; then
+    echo "CR.DEBUG ${1}"
+  fi
+}
+
+function info {
+  if [ "${CR_LOG_INFO}" = "1" ]; then
+    echo "CR.INFO  ${1}"
+  fi
+}
+
+function output {
+  echo "CR       ${1}"
+}
+
 function fail_with_msg {
-  echo "Exiting because operation failed: ${1}"
+  echo "Exiting due to failure: ${1}"
   exit 1
 }
 
@@ -68,15 +84,12 @@ function get_branch_data_dir_and_file {
   get_project_base_dir_name
   get_current_branch
 
-  echo "PROJECT=${PROJECT}"
-  echo "PROJECT_BASE_DIR_NAME=${PROJECT_BASE_DIR_NAME}"
-  echo "MY_CURRENT_BRANCH=${MY_CURRENT_BRANCH}"
-
   CR_DATA_DIR="${scratch_dir}/${PROJECT}"
 
   # Using PROJECT_BASE_DIR_NAME as the filename allows multiple simultaneous reviews of different local copies
   # of the same repo. Rarely needed but helpful to have when it is needed.
   CR_DATA_FILE="${CR_DATA_DIR}/${PROJECT_BASE_DIR_NAME}"
+  debug "get_branch_data_dir_and_file: CR_DATA_FILE=${CR_DATA_FILE}"
 }
 
 # Reads the following:
@@ -96,7 +109,7 @@ function store_current_branch_name {
   mkdir -p "${CR_DATA_DIR}"
 
   echo "${MY_CURRENT_BRANCH}" >"${CR_DATA_FILE}"
-  echo "remembered current branch (${MY_CURRENT_BRANCH}) in ${CR_DATA_FILE}"
+  debug "remembered current branch (${MY_CURRENT_BRANCH}) in ${CR_DATA_FILE}"
 }
 
 # Reads the following:
@@ -117,7 +130,7 @@ function read_stored_branch_name {
   # TODO: Better fallback for STORED_BRANCH_NAME, e.g. specify a DEFAULT_RESTORE_BRANCH in config.
   STORED_BRANCH_NAME=$(cat "${CR_DATA_FILE}" 2>/dev/null || echo 'master')
 
-  echo "STORED_BRANCH_NAME=${STORED_BRANCH_NAME}"
+  info "STORED_BRANCH_NAME=${STORED_BRANCH_NAME}"
 }
 
 function delete_stored_branch_name {
@@ -126,37 +139,35 @@ function delete_stored_branch_name {
   # Obtain MY_CURRENT_BRANCH, CR_DATA_DIR, and CR_DATA_FILE
   get_branch_data_dir_and_file "${scratch_dir}"
 
-  rm "${CR_DATA_FILE}" || echo "failed to delete ${CR_DATA_FILE}"
+  rm "${CR_DATA_FILE}" || output "failed to delete ${CR_DATA_FILE}"
 }
 
-# Checks out EDITED_BRANCH for review and does a preview merge of that branch into a copy
+# Checks out FEATURE_BRANCH for review and does a preview merge of that branch into a copy
 # of TARGET_BRANCH. (The copy is TEMP_BRANCH.)
 # Args:
-# 1. EDITED_BRANCH (required)
-# 2. TARGET_BRANCH (optional, defaults to value specified for DEFAULT_TARGET_BRANCH in .codereview.config.default or .codereview.config)
-# 3. TEMP_BRANCH (optional, defaults to value specified for DEFAULT_TEMP_BRANCH in .codereview.config.default or .codereview.config)
+# 1. FEATURE_BRANCH (required) contains the code to be reviewed
+# 2. TARGET_BRANCH (optional) the branch into which FEATURE_BRANCH will be merged;
+# If not specified, uses DEFAULT_TARGET_BRANCH from .codereview.config.default with override by .codereview.config)
+# 3. TEMP_BRANCH (optional) the name of the temporary branch (copy of TARGET_BRANCH) that will be created for
+# the merge preview. Defaults to DEFAULT_TEMP_BRANCH from .codereview.config.default with override by .codereview.config)
 function review_branch {
-  EDITED_BRANCH=$1
+  FEATURE_BRANCH=$1
   TARGET_BRANCH=$2
   TEMP_BRANCH=$3
 
-  echo "EDITED_BRANCH=${EDITED_BRANCH}"
   [ -z "${1:-}" ] && {
-    echo "must specify branch to review"
-    exit 1
+    fail_with_msg "review_branch: must specify branch to review (FEATURE_BRANCH)"
   }
 
   [ -z "${2:-}" ] && TARGET_BRANCH=${DEFAULT_TARGET_BRANCH}
-  echo "TARGET_BRANCH=${TARGET_BRANCH}"
+  [ -z "${3:-}" ] && TEMP_BRANCH=${DEFAULT_TEMP_BRANCH}
 
-  [ -z "${3:-}" ] && TEMP_BRANCH=review
-  echo "TEMP_BRANCH=${TEMP_BRANCH}"
+  debug "review_branch: FEATURE_BRANCH=${FEATURE_BRANCH}, TARGET_BRANCH=${TARGET_BRANCH}, TEMP_BRANCH=${TEMP_BRANCH}"
 
   # review-finished will use this to restore the current branch
   # SCRATCH_DIR is read from config so we disable this warning https://www.shellcheck.net/wiki/SC2153
   # shellcheck disable=SC2153
   store_current_branch_name "${SCRATCH_DIR}"
-  echo "PROJECT_BASE_DIR_NAME=${PROJECT_BASE_DIR_NAME}"
 
   # Save any outstanding changes
   git stash save
@@ -167,32 +178,32 @@ function review_branch {
   git pull origin "${TARGET_BRANCH}" || fail_with_msg "git pull origin ${TARGET_BRANCH}"
 
   # Get a local copy of the branch to be reviewed
-  git fetch origin "${EDITED_BRANCH}" || fail_with_msg "git fetch origin ${EDITED_BRANCH}"
-  git checkout "${EDITED_BRANCH}" || fail_with_msg "git checkout ${EDITED_BRANCH}"
+  git fetch origin "${FEATURE_BRANCH}" || fail_with_msg "git fetch origin ${FEATURE_BRANCH}"
+  git checkout "${FEATURE_BRANCH}" || fail_with_msg "git checkout ${FEATURE_BRANCH}"
   # Make sure it is up to date - e.g. updates after earlier feedback.
-  git pull origin "${EDITED_BRANCH}" || fail_with_msg "git pull origin ${EDITED_BRANCH}"
+  git pull origin "${FEATURE_BRANCH}" || fail_with_msg "git pull origin ${FEATURE_BRANCH}"
 
   # Now make a copy of master to preview the merge with.
   git checkout "${TARGET_BRANCH}"
   # Delete any older review branch
-  git branch -D --quiet "${TEMP_BRANCH}" 2>/dev/null || echo "no previous work branch found (using ${TEMP_BRANCH})"
+  git branch -D --quiet "${TEMP_BRANCH}" 2>/dev/null || info "no previous work branch found (using ${TEMP_BRANCH})"
   # Create a new work branch
   git checkout -b "${TEMP_BRANCH}" || fail_with_msg "git checkout -b ${TEMP_BRANCH}"
   # Apply changes without committing.  View diffs in IDE
-  git merge --no-commit --no-ff -- "${EDITED_BRANCH}" || fail_with_msg "git merge --no-commit --no-ff -- ${EDITED_BRANCH}"
+  git merge --no-commit --no-ff -- "${FEATURE_BRANCH}" || fail_with_msg "git merge --no-commit --no-ff -- ${FEATURE_BRANCH}"
 
-  echo
-  echo "git status: "
-  echo
+  output
+  output "git status: "
+  output
   git st
 
-  echo
-  echo
-  echo "EDITED_BRANCH=${EDITED_BRANCH}, TARGET_BRANCH=${TARGET_BRANCH}"
-  echo
-  echo "When finished with review, you can to discard the preview merge by running:"
-  echo "             ${DIR}/review-finished"
-  echo
+  output
+  output
+  output "FEATURE_BRANCH=${FEATURE_BRANCH}, TARGET_BRANCH=${TARGET_BRANCH}, TEMP_BRANCH=${TEMP_BRANCH}"
+  output
+  output "When finished with review, you can to discard the preview merge by running:"
+  output "             ${DIR}/review-finished"
+  output
 
 }
 
@@ -203,8 +214,7 @@ function review_pr {
   PR_NUM=$1
 
   get_repo_owner_and_name
-  echo "OWNER=${OWNER}"
-  echo "PROJECT=${PROJECT}"
+  info "OWNER=${OWNER}, PROJECT=${PROJECT}"
 
   # read oauth token from file
   ghub_oauth=$(<"${DIR}/.ghub_oauth_pr_review")
@@ -220,9 +230,9 @@ function review_pr {
   fi
 
   TO=$(echo "${api_result}" | jq -r '.base.ref')
-  echo "TO=${TO}"
+  info "TO=${TO}"
 
-  review_branch "${FROM}" "${TO}"
+  review_branch "${FROM}" "${TO}" "${DEFAULT_TEMP_BRANCH}"
 }
 
 # Discards all changes from TEMP_BRANCH and deletes it.
@@ -249,15 +259,19 @@ function review_finished {
     fail_with_msg "unable to determine RESTORE_BRANCH"
   fi
 
-  echo RESTORE_BRANCH="${RESTORE_BRANCH}"
+  output RESTORE_BRANCH="${RESTORE_BRANCH}"
 
   get_current_branch
+
+  # TODO clean up this MY_CURRENT_BRANCH and TEMP_BRANCH thing and get rid of hard-coded 'review'
+  # Likely: store temp branch in the data file along with the branch to restore and then do safety check
+  # here vs that value. So if we stored temp branch of 'review' but our current branch is 'main', then abort.
   if [ "${MY_CURRENT_BRANCH}" != "review" ]; then
     fail_with_msg "expected current branch: review. actual current branch: ${MY_CURRENT_BRANCH}"
   fi
 
   [ -z "${2:-}" ] && TEMP_BRANCH=review
-  echo TEMP_BRANCH="${TEMP_BRANCH}"
+  output "review_finished: TEMP_BRANCH=${TEMP_BRANCH}, RESTORE_BRANCH=${RESTORE_BRANCH}"
 
   git merge --abort
   git fetch origin "${RESTORE_BRANCH}" || fail_with_msg "git fetch origin ${RESTORE_BRANCH}"
@@ -277,28 +291,22 @@ function help {
 
 the_cmd="$1"
 shift
-echo "the_cmd=${the_cmd}"
 
 case "${the_cmd}" in
 pr)
-  echo "calling review_pr"
   review_pr "$@"
   ;;
 branch)
-  echo "calling review_branch"
   review_branch "$@"
   ;;
 
 finished)
-  echo "calling review_finished"
   review_finished "$@"
   ;;
 help)
-  echo "calling help"
   help "$@"
   ;;
 *)
-  echo "unknown command: ${the_cmd}"
-  exit 1
+  fail_with_msg "unknown command: ${the_cmd}"
   ;;
 esac
