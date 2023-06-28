@@ -7,5 +7,7 @@ DEFAULT_TEMP_BRANCH="review"
 
 SCRATCH_DIR="${HOME}/.tmp/codereview"
 
+GH_HOST="api.github.com"
+
 CR_LOG_DEBUG=0
 CR_LOG_INFO=0

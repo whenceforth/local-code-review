@@ -235,6 +235,29 @@ function review_pr {
   review_branch "${FROM}" "${TO}" "${DEFAULT_TEMP_BRANCH}"
 }
 
+function review_pr_gh {
+  PR_NUM=$1
+
+  get_repo_owner_and_name
+  info "OWNER=${OWNER}, PROJECT=${PROJECT}"
+
+  gh auth login --hostname '${GH_HOST}' --with-token < "${DIR}/.ghub_oauth_pr_review"
+
+  api_result=$(gh pr view ${PR_NUM}  --json baseRefName,headRefName )
+
+  # jq -r emits strings without wrapping quotes
+  FROM=$(echo "${api_result}" | jq -r '.headRefName')
+
+  if [ -z "$FROM" ] || [ "$FROM" = "null" ]; then
+    fail_with_msg "gh client call failed: api_result=${api_result}"
+  fi
+
+  TO=$(echo "${api_result}" | jq -r '.baseRefName')
+  info "TO=${TO}"
+
+  review_branch "${FROM}" "${TO}" "${DEFAULT_TEMP_BRANCH}"
+}
+
 # Discards all changes from TEMP_BRANCH and deletes it.
 # Checks out the stored branch and pulls latest.
 # Optional argument provided can override the stored branch name
@@ -294,7 +317,7 @@ shift
 
 case "${the_cmd}" in
 pr)
-  review_pr "$@"
+  review_pr_gh "$@"
   ;;
 branch)
   review_branch "$@"
