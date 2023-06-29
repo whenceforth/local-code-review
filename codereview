@@ -7,6 +7,7 @@ override_config="${DIR}/.codereview.config"
 if [ -r "$override_config" ]; then
   # https://www.shellcheck.net/wiki/SC1090
   # shellcheck source=/dev/null
+  echo "using override config: ${override_config}"
   source "${override_config}"
 else
   echo "using default config only"
@@ -239,9 +240,14 @@ function review_pr_gh {
   PR_NUM=$1
 
   get_repo_owner_and_name
-  info "OWNER=${OWNER}, PROJECT=${PROJECT}"
+  info "OWNER=${OWNER}, PROJECT=${PROJECT}, GH_HOST=${GH_HOST}"
 
-  gh auth login --hostname '${GH_HOST}' --with-token < "${DIR}/.ghub_oauth_pr_review"
+
+  if [ -z "${GH_HOST}" ]; then
+    gh auth login --with-token < "${DIR}/.ghub_oauth_pr_review"
+  else
+    gh auth login --hostname "${GH_HOST}" --with-token < "${DIR}/.ghub_oauth_pr_review"
+  fi
 
   api_result=$(gh pr view ${PR_NUM}  --json baseRefName,headRefName )
 
