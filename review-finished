@@ -15,4 +15,4 @@
 #set -o xtrace
 
 DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
-"${DIR}/codereview" finished "$@"
+"${DIR}/codereview.sh" finished "$@"
