@@ -37,9 +37,10 @@ works for cleaning up in this case.
 1. bash (accessed via `#!/usr/bin/env bash`)
 2. awk
 3. cut
-4. grep
-5. [jq](https://github.com/stedolan/jq) for JSON parsing a GitHub api response
-6. a GitHub oauth token that gives permission to read the repo in question. 
+4. [gh](https://cli.github.com/), the GitHub CLI client 
+5. grep
+6. [jq](https://github.com/stedolan/jq) for JSON parsing a GitHub api response
+7. a GitHub oauth token that gives permission to read the repo in question. 
    - For a 'Classic' token, the permissions `repo:status` and `public_repo` will 
    suffice in many cases.
    - The token should be stored in the same folder as the scripts, with the name `.ghub_oauth_pr_review`
