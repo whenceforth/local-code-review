@@ -2,7 +2,7 @@
 
 scratch_dir="${HOME}/.tmp/codereview"
 
-DEFAULT_TARGET_BRANCH="master"
+DEFAULT_TARGET_BRANCH="main"
 DEFAULT_TEMP_BRANCH="review"
 
 SCRATCH_DIR="${HOME}/.tmp/codereview"
