@@ -55,13 +55,18 @@ function confirm {
 
 # Sets environment variables OWNER and PROJECT to values parsed from `git config --get remote.origin.url`
 # It requires that upstream be referred to as origin.
-# TODO Needs to work for git@github.com... and https://github.com/...
 function get_repo_owner_and_name {
 
-  local origin_url
-  origin_url=$(git config --get remote.origin.url)
-  OWNER=$(echo "${origin_url}" | awk -F'/' '{print $4}')
-  PROJECT=$(echo "${origin_url}" | awk -F'/' '{print $5}' | awk -F'.' '{print $1}')
+  declare origin_url=$(git config --get remote.origin.url)
+
+  # The following line transforms both https://github.com/whenceforth/exercise-code-review.git and
+  # git@github.com:whenceforth/exercise-code-review.git into the same format so that we can then
+  # extract OWNER and PROJECT with only 1 awk program for each item.
+  declare common_format=$(echo ${origin_url} | sed 's/https:/https/' | sed 's/@/\/\//' | tr ':' '/')
+
+  OWNER=$(echo "${common_format}" | awk -F'/' '{print $4}')
+  PROJECT=$(echo "${common_format}" | awk -F'/' '{print $5}' | awk -F'.' '{print $1}')
+
   debug "get_repo_owner_and_name: OWNER=${OWNER}, PROJECT=${PROJECT}"
 }
 
