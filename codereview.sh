@@ -57,10 +57,17 @@ function confirm {
 # It requires that upstream be referred to as origin.
 function get_repo_owner_and_name {
 
-  local origin_url
-  origin_url=$(git config --get remote.origin.url)
-  OWNER=$(echo "${origin_url}" | awk -F'/' '{print $1}' | awk -F':' '{print $2}')
-  PROJECT=$(echo "${origin_url}" | awk -F'/' '{print $2}' | awk -F'.' '{print $1}')
+  declare origin_url=$(git config --get remote.origin.url)
+
+  # The following line transforms both https://github.com/whenceforth/exercise-code-review.git and
+  # git@github.com:whenceforth/exercise-code-review.git into the same format so that we can then
+  # extract OWNER and PROJECT with only 1 awk program for each item.
+  declare common_format=$(echo ${origin_url} | sed 's/https:/https/' | sed 's/@/\/\//' | tr ':' '/')
+
+  OWNER=$(echo "${common_format}" | awk -F'/' '{print $4}')
+  PROJECT=$(echo "${common_format}" | awk -F'/' '{print $5}' | awk -F'.' '{print $1}')
+
+  debug "get_repo_owner_and_name: OWNER=${OWNER}, PROJECT=${PROJECT}"
 }
 
 # Set environment variable PROJECT_BASE_DIR_NAME to the name of the top level directory
@@ -71,6 +78,36 @@ function get_repo_owner_and_name {
 function get_project_base_dir_name {
   rev_parse=$(git rev-parse --show-toplevel)
   PROJECT_BASE_DIR_NAME=$(basename "$rev_parse")
+}
+
+# https://unix.stackexchange.com/questions/366581/bash-associative-array-printing
+function print_array {
+  declare -n __p="$1"
+  for k in "${!__p[@]}"; do
+    printf "%s=%s\n" "$k" "${__p[$k]}"
+  done
+}
+
+# arguments:
+# 1: The branch for which we want to get info
+# 2: An associative array name reference to put the info in
+# Side effects:
+# Sets the keys tracking, remote, and remote_url in the provided associative array
+function get_branch_info {
+  declare the_branch="${1}"
+  declare -n my_assoc="${2}"
+  my_assoc["branch"]="${the_branch}"
+
+  declare tracking=$(git config branch.the_branch.merge)
+  my_assoc["tracking"]=${tracking}
+
+  declare remote=$(git config branch.the_branch.remote)
+  my_assoc["remote"]="${remote}"
+
+  declare remote_url=$(git config remote.url)
+  my_assoc["remote_url"]="${remote_url}"
+
+  debug "get_branch_info: the_branch=${the_branch}, tracking=${tracking}, remote=${remote}, remote_url=${remote_url}"
 }
 
 # Stores current git branch name in MY_CURRENT_BRANCH
@@ -89,7 +126,8 @@ function get_branch_data_dir_and_file {
 
   # Using PROJECT_BASE_DIR_NAME as the filename allows multiple simultaneous reviews of different local copies
   # of the same repo. Rarely needed but helpful to have when it is needed.
-  CR_DATA_FILE="${CR_DATA_DIR}/${PROJECT_BASE_DIR_NAME}"
+  CR_DATA_FILE="${CR_DATA_DIR}/${PROJECT_BASE_DIR_NAME}.txt"
+  info "get_branch_data_dir_and_file: PROJECT=${PROJECT}, CR_DATA_DIR=${CR_DATA_DIR}, CR_DATA_FILE=${CR_DATA_FILE}"
   debug "get_branch_data_dir_and_file: CR_DATA_FILE=${CR_DATA_FILE}"
 }
 
@@ -106,6 +144,8 @@ function store_current_branch_name {
 
   # Obtain MY_CURRENT_BRANCH, CR_DATA_DIR, and CR_DATA_FILE
   get_branch_data_dir_and_file "${scratch_dir}"
+
+  debug "store_current_branch_name: CR_DATA_FILE=${CR_DATA_FILE}"
 
   mkdir -p "${CR_DATA_DIR}"
 
@@ -127,6 +167,8 @@ function read_stored_branch_name {
 
   # Obtain MY_CURRENT_BRANCH, CR_DATA_DIR, and CR_DATA_FILE
   get_branch_data_dir_and_file "${scratch_dir}"
+
+  debug "read_stored_branch_name: CR_DATA_FILE=${CR_DATA_FILE}"
 
   # TODO: Better fallback for STORED_BRANCH_NAME, e.g. specify a DEFAULT_RESTORE_BRANCH in config.
   STORED_BRANCH_NAME=$(cat "${CR_DATA_FILE}" 2>/dev/null || echo 'master')
@@ -172,19 +214,37 @@ function review_branch {
 
   # Save any outstanding changes
   git stash save
+  declare -A target_branch_info
+  get_branch_info "${TARGET_BRANCH}" target_branch_info
 
   # Get latest code, including branch to be reviewed
-  git fetch origin "${TARGET_BRANCH}" || fail_with_msg "git fetch origin ${TARGET_BRANCH}"
-  git checkout "${TARGET_BRANCH}" || fail_with_msg "git checkout ${TARGET_BRANCH}"
-  git pull origin "${TARGET_BRANCH}" || fail_with_msg "git pull origin ${TARGET_BRANCH}"
+
+  if [ -n "${target_branch_info[remote]}" ]; then
+    git fetch origin "${TARGET_BRANCH}" || fail_with_msg "git fetch origin for TARGET_BRANCH=${TARGET_BRANCH}"
+  fi
+
+  git checkout "${TARGET_BRANCH}" || fail_with_msg "git checkout for TARGET_BRANCH=${TARGET_BRANCH}"
+
+  if [ -n "${target_branch_info[remote]}" ]; then
+    git pull origin "${TARGET_BRANCH}" || fail_with_msg "git pull origin for TARGET_BRANCH=${TARGET_BRANCH}"
+  fi
+
+  declare -A feature_branch_info
+  get_branch_info "${FEATURE_BRANCH}" feature_branch_info
 
   # Get a local copy of the branch to be reviewed
-  git fetch origin "${FEATURE_BRANCH}" || fail_with_msg "git fetch origin ${FEATURE_BRANCH}"
-  git checkout "${FEATURE_BRANCH}" || fail_with_msg "git checkout ${FEATURE_BRANCH}"
-  # Make sure it is up to date - e.g. updates after earlier feedback.
-  git pull origin "${FEATURE_BRANCH}" || fail_with_msg "git pull origin ${FEATURE_BRANCH}"
+  if [ -n "${feature_branch_info[remote]}" ]; then
+    git fetch origin "${FEATURE_BRANCH}" || fail_with_msg "git fetch origin ${FEATURE_BRANCH}"
+  fi
 
-  # Now make a copy of master to preview the merge with.
+  git checkout "${FEATURE_BRANCH}" || fail_with_msg "git checkout ${FEATURE_BRANCH}"
+
+  if [ -n "${feature_branch_info[remote]}" ]; then
+    # Make sure it is up to date - e.g. updates after earlier feedback.
+    git pull origin "${FEATURE_BRANCH}" || fail_with_msg "git pull origin ${FEATURE_BRANCH}"
+  fi
+
+  # Now make a copy of TARGET_BRANCH to preview the merge with.
   git checkout "${TARGET_BRANCH}"
   # Delete any older review branch
   git branch -D --quiet "${TEMP_BRANCH}" 2>/dev/null || info "no previous work branch found (using ${TEMP_BRANCH})"
@@ -240,16 +300,18 @@ function review_pr_gh {
   PR_NUM=$1
 
   get_repo_owner_and_name
-  info "OWNER=${OWNER}, PROJECT=${PROJECT}, GH_HOST=${GH_HOST}"
+  info "review_pr_gh: OWNER=${OWNER}, PROJECT=${PROJECT}, GH_HOST=${GH_HOST}"
 
+  declare token_file="${DIR}/.ghub_oauth_pr_review"
+  info "review_pr_gh: token_file=${token_file}"
 
   if [ -z "${GH_HOST}" ]; then
-    gh auth login --with-token < "${DIR}/.ghub_oauth_pr_review"
+    gh auth login --with-token <"${token_file}"
   else
-    gh auth login --hostname "${GH_HOST}" --with-token < "${DIR}/.ghub_oauth_pr_review"
+    gh auth login --hostname "${GH_HOST}" --with-token <"${token_file}"
   fi
 
-  api_result=$(gh pr view ${PR_NUM}  --json baseRefName,headRefName )
+  api_result=$(gh pr view ${PR_NUM} --json baseRefName,headRefName)
 
   # jq -r emits strings without wrapping quotes
   FROM=$(echo "${api_result}" | jq -r '.headRefName')
@@ -303,9 +365,19 @@ function review_finished {
   output "review_finished: TEMP_BRANCH=${TEMP_BRANCH}, RESTORE_BRANCH=${RESTORE_BRANCH}"
 
   git merge --abort
-  git fetch origin "${RESTORE_BRANCH}" || fail_with_msg "git fetch origin ${RESTORE_BRANCH}"
+
+  declare -A restore_branch_info
+  get_branch_info "${RESTORE_BRANCH}" restore_branch_info
+
+  if [ -n "${restore_branch_info[remote]}" ]; then
+    git fetch origin "${RESTORE_BRANCH}" || fail_with_msg "git fetch origin ${RESTORE_BRANCH}"
+  fi
+
   git checkout "${RESTORE_BRANCH}" || fail_with_msg "git checkout ${RESTORE_BRANCH}"
-  git pull origin "${RESTORE_BRANCH}" || fail_with_msg "git pull origin ${RESTORE_BRANCH}"
+
+  if [ -n "${restore_branch_info[remote]}" ]; then
+    git pull origin "${RESTORE_BRANCH}" || fail_with_msg "git pull origin ${RESTORE_BRANCH}"
+  fi
 
   if [ "$can_delete_stored_branch_name" = "1" ]; then
     delete_stored_branch_name "${SCRATCH_DIR}"
