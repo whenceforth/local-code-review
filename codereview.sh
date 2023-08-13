@@ -55,6 +55,7 @@ function confirm {
 
 # Sets environment variables OWNER and PROJECT to values parsed from `git config --get remote.origin.url`
 # It requires that upstream be referred to as origin.
+# TODO Needs to work for git@github.com... and https://github.com/...
 function get_repo_owner_and_name {
 
   local origin_url
@@ -290,12 +291,15 @@ function review_pr_gh {
   PR_NUM=$1
 
   get_repo_owner_and_name
-  info "OWNER=${OWNER}, PROJECT=${PROJECT}, GH_HOST=${GH_HOST}"
+  info "review_pr_gh: OWNER=${OWNER}, PROJECT=${PROJECT}, GH_HOST=${GH_HOST}"
+
+  declare token_file="${DIR}/.ghub_oauth_pr_review"
+  info "review_pr_gh: token_file=${token_file}"
 
   if [ -z "${GH_HOST}" ]; then
-    gh auth login --with-token <"${DIR}/.ghub_oauth_pr_review"
+    gh auth login --with-token <"${token_file}"
   else
-    gh auth login --hostname "${GH_HOST}" --with-token <"${DIR}/.ghub_oauth_pr_review"
+    gh auth login --hostname "${GH_HOST}" --with-token <"${token_file}"
   fi
 
   api_result=$(gh pr view ${PR_NUM} --json baseRefName,headRefName)
