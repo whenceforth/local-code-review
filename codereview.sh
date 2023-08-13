@@ -145,6 +145,8 @@ function store_current_branch_name {
   # Obtain MY_CURRENT_BRANCH, CR_DATA_DIR, and CR_DATA_FILE
   get_branch_data_dir_and_file "${scratch_dir}"
 
+  debug "store_current_branch_name: CR_DATA_FILE=${CR_DATA_FILE}"
+
   mkdir -p "${CR_DATA_DIR}"
 
   echo "${MY_CURRENT_BRANCH}" >"${CR_DATA_FILE}"
@@ -165,6 +167,8 @@ function read_stored_branch_name {
 
   # Obtain MY_CURRENT_BRANCH, CR_DATA_DIR, and CR_DATA_FILE
   get_branch_data_dir_and_file "${scratch_dir}"
+
+  debug "read_stored_branch_name: CR_DATA_FILE=${CR_DATA_FILE}"
 
   # TODO: Better fallback for STORED_BRANCH_NAME, e.g. specify a DEFAULT_RESTORE_BRANCH in config.
   STORED_BRANCH_NAME=$(cat "${CR_DATA_FILE}" 2>/dev/null || echo 'master')
