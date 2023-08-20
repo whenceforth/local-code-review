@@ -57,8 +57,11 @@ a file called `.codereview.config`.
 
 ## Improvements
 These started as quick and dirty scripts for personal use only and have evolved 
-slowly over the years. For wider use they'd probably benefit from, among other things:
+in an ad hoc manner over the years, usually with quick and dirty fixes focused only
+on a particular current need. For wider use they'd probably benefit from, among other things:
 
-1. better option processing
-2. a help option
-3. bash linting
+1. automated tests
+2. better option processing
+3. a help option
+4. bash linting
+5. maybe just a re-write 

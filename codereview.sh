@@ -98,13 +98,21 @@ function get_branch_info {
   declare -n my_assoc="${2}"
   my_assoc["branch"]="${the_branch}"
 
-  declare tracking=$(git config branch.the_branch.merge)
+  declare tracking=$(git config branch.${the_branch}.merge)
+
+  if [ -z "${tracking}" ]; then
+    debug "get_branch_info: git config returned nothing. Fetching origin ${the_branch}"
+    git fetch origin "${the_branch}"
+    tracking=$(git config branch.${the_branch}.merge)
+    debug "get_branch_info: After fetching origin ${the_branch}, tracking=${tracking}"
+  fi;
+
   my_assoc["tracking"]=${tracking}
 
-  declare remote=$(git config branch.the_branch.remote)
+  declare remote=$(git config branch.${the_branch}.remote)
   my_assoc["remote"]="${remote}"
 
-  declare remote_url=$(git config remote.url)
+  declare remote_url=$(git remote get-url origin)
   my_assoc["remote_url"]="${remote_url}"
 
   debug "get_branch_info: the_branch=${the_branch}, tracking=${tracking}, remote=${remote}, remote_url=${remote_url}"
