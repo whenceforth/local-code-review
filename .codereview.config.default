@@ -1,15 +1,18 @@
 #!/usr/bin/env bash
 
-scratch_dir="${HOME}/.tmp/codereview"
+scratch_dir="~/.tmp/codereview"
 
 DEFAULT_TARGET_BRANCH="main"
 DEFAULT_TEMP_BRANCH="review"
 
-SCRATCH_DIR="${HOME}/.tmp/codereview"
+SCRATCH_DIR="~/.tmp/codereview"
 
 # Not needed for public Github
 # If you are using a Github Enterprise instance, specify GH_HOST in .codereview.config
 GH_HOST=
+
+GL_API_ENDPOINT = 'https://gitlab.com/api/v4'
+
 
 CR_LOG_DEBUG=0
 CR_LOG_INFO=0

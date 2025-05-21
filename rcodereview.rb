@@ -50,16 +50,34 @@ end
 
 def load_configuration
   CONFIG.merge!(load_config_file(DEFAULT_CONFIG_PATH))
-  if File.exist?(OVERRIDE_CONFIG_PATH) && File.readable?(OVERRIDE_CONFIG_PATH)
-    info "using override config: #{OVERRIDE_CONFIG_PATH}"
-    CONFIG.merge!(load_config_file(OVERRIDE_CONFIG_PATH))
-  else
-    info "using default config only"
+  override_config_path = OVERRIDE_CONFIG_PATH
+  if override_config_path
+    override_config_path = File.expand_path(override_config_path)
+    if File.exist?(override_config_path) && File.readable?(override_config_path)
+      info "using override config: #{override_config_path}"
+      CONFIG.merge!(load_config_file(override_config_path))
+    else
+      info "using default config only"
+    end
   end
+
+  scratch_dir_config = CONFIG['SCRATCH_DIR']
+  if scratch_dir_config
+    CONFIG['SCRATCH_DIR'] = File.expand_path(scratch_dir_config)
+  else
+    CONFIG['SCRATCH_DIR'] = File.join(ENV['HOME'], '.tmp', 'codereview')
+  end
+  CONFIG['SCRATCH_DIR'] ||= File.join(ENV['HOME'], '.tmp', 'codereview')
+
   # Set defaults if not in config
   CONFIG['DEFAULT_TARGET_BRANCH'] ||= 'master'
   CONFIG['DEFAULT_TEMP_BRANCH'] ||= 'review'
-  CONFIG['SCRATCH_DIR'] ||= File.join(ENV['HOME'], '.tmp', 'codereview')
+
+  unless CONFIG['GL_API_ENDPOINT']
+    CONFIG['GL_API_ENDPOINT'] = ENV['GITLAB_API_ENDPOINT'] || 'https://gitlab.com/api/v4'
+  end
+  CONFIG['GL_API_ENDPOINT'] = CONFIG['GL_API_ENDPOINT'] || ENV['GITLAB_API_ENDPOINT'] || 'https://gitlab.com/api/v4'
+  CONFIG['GL_TOKEN_FILE'] = File.join(SCRIPT_DIR, '.glab_oauth_pr_review')
 end
 
 def confirm_action
@@ -77,6 +95,7 @@ end
 
 # Memoization for git object
 @git_object = nil
+
 def g
   @git_object ||= Git.open(Dir.pwd) # Assumes running from within the repo
 rescue ArgumentError => e
@@ -136,7 +155,7 @@ def get_branch_info(branch_name)
     # Note: g.branch(branch_name).config('merge') is not available in the gem.
     # We use g.config directly.
     tracking_ref = g.config("branch.#{branch_name}.merge")
-    remote_name  = g.config("branch.#{branch_name}.remote")
+    remote_name = g.config("branch.#{branch_name}.remote")
 
     if tracking_ref.nil? || tracking_ref.empty?
       debug "get_branch_info: No tracking info for local branch '#{branch_name}'. Fetching 'origin #{branch_name}' to update remote-tracking branch."
@@ -149,7 +168,7 @@ def get_branch_info(branch_name)
       end
       # Re-check config (though fetch itself doesn't alter this local config)
       tracking_ref = g.config("branch.#{branch_name}.merge")
-      remote_name  = g.config("branch.#{branch_name}.remote")
+      remote_name = g.config("branch.#{branch_name}.remote")
       debug "get_branch_info: After fetching, tracking=#{tracking_ref}"
     end
 
@@ -169,7 +188,6 @@ def get_branch_info(branch_name)
     branch_info['remote_url'] ||= g.remote('origin')&.url
   end
 
-
   debug "get_branch_info: branch_name=#{branch_name}, tracking=#{branch_info['tracking']}, remote=#{branch_info['remote']}, remote_url=#{branch_info['remote_url']}"
   branch_info
 end
@@ -179,6 +197,7 @@ def get_current_branch_name
 end
 
 CR_DATA_DETAILS = {}
+
 def get_branch_data_dir_and_file(scratch_dir_base)
   return if CR_DATA_DETAILS[:file_path] # Already calculated
 
@@ -233,7 +252,7 @@ def review_branch(feature_branch, target_branch = nil, temp_branch = nil)
   fail_with_msg "review_branch: must specify branch to review (FEATURE_BRANCH)" if feature_branch.nil? || feature_branch.empty?
 
   target_branch ||= CONFIG['DEFAULT_TARGET_BRANCH']
-  temp_branch   ||= CONFIG['DEFAULT_TEMP_BRANCH']
+  temp_branch ||= CONFIG['DEFAULT_TEMP_BRANCH']
 
   debug "review_branch: FEATURE_BRANCH=#{feature_branch}, TARGET_BRANCH=#{target_branch}, TEMP_BRANCH=#{temp_branch}"
   confirm_action
@@ -260,7 +279,6 @@ def review_branch(feature_branch, target_branch = nil, temp_branch = nil)
     end
     info "No local changes to stash or stash command failed gracefully."
   end
-
 
   target_branch_info = get_branch_info(target_branch)
 
@@ -363,7 +381,6 @@ def review_branch(feature_branch, target_branch = nil, temp_branch = nil)
     output "WARN: `git merge --no-commit` exited with code #{$?.exitstatus}. This might indicate merge conflicts to review."
   end
 
-
   output ""
   output "git status: "
   output ""
@@ -422,7 +439,6 @@ def review_pr_gh(pr_num)
   review_branch(from_branch, to_branch, CONFIG['DEFAULT_TEMP_BRANCH'])
 end
 
-
 def review_finished(restore_branch_override = nil, temp_branch_override = nil)
   # set -o xtrace equivalent can be very verbose; skipping for now.
   # Can add `set -x` to system calls if needed for specific commands.
@@ -436,7 +452,6 @@ def review_finished(restore_branch_override = nil, temp_branch_override = nil)
   if restore_branch_override.nil? && (stored_branch_name && !stored_branch_name.empty? && stored_branch_name != CONFIG['DEFAULT_TARGET_BRANCH'])
     can_delete_stored_file = true
   end
-
 
   if restore_branch.nil? || restore_branch.empty?
     # Fallback: try to get default branch from remote 'origin'
@@ -509,13 +524,11 @@ def review_finished(restore_branch_override = nil, temp_branch_override = nil)
     info "No stashes found to apply."
   end
 
-
   if can_delete_stored_file
     delete_stored_branch_name(CONFIG['SCRATCH_DIR'])
   else
     debug "Not deleting stored branch name file (override used or was default)."
   end
-
 
   if g.branches.local.map(&:name).include?(temp_branch)
     begin
@@ -548,7 +561,6 @@ def system_must_succeed(command, show_output: true, allow_fail_message: nil)
   stdout_str # Return stdout for potential further use
 end
 
-
 def print_help
   output "Usage: #{$0} <command> [options]"
   output "Commands:"
@@ -580,7 +592,7 @@ if __FILE__ == $0
   when 'branch'
     feature_branch = ARGV.shift
     target_branch = ARGV.shift # optional
-    temp_branch = ARGV.shift   # optional
+    temp_branch = ARGV.shift # optional
     fail_with_msg "Feature branch name is required for 'branch' command." unless feature_branch
     review_branch(feature_branch, target_branch, temp_branch)
   when 'finished'
