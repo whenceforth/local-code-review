@@ -1,7 +1,8 @@
 # Code Review Scripts
 
 ## Motivation
-When I review code, in addition to viewing the diffs on GitHub, I like to navigate around in the 
+When I review code, in addition to viewing the diffs on GitHub or GitLab, I like to 
+navigate around in the 
 changed codebase to explore the ramifications of those changes and look at related 
 code. This helps me understand the context and ask better questions. I find it's 
 easiest to do that if I can bring the proposed changes into my local development 
@@ -34,34 +35,51 @@ works for cleaning up in this case.
 
 ## Requirements
 
-1. bash (accessed via `#!/usr/bin/env bash`)
-2. awk
-3. cut
-4. [gh](https://cli.github.com/), the GitHub CLI client 
-5. grep
-6. [jq](https://github.com/stedolan/jq) for JSON parsing a GitHub api response
-7. a GitHub oauth token that gives permission to read the repo in question. 
-   - For a 'Classic' token, the permissions `repo:status` and `public_repo` will 
+1. ruby
+2. ruby's bundler gem
+3. If using GitHub: 
+   - The GitHub API client. On Mac: `brew install gh`
+   - A GitHub oauth token that gives permission to read the repo in question. 
+       - For a 'Classic' token, the permissions `repo:status` and `public_repo` will 
    suffice in many cases.
-   - The token should be stored in the same folder as the scripts, with the name `.ghub_oauth_pr_review`
-   - `.gitignore` includes an entry for `.ghub_oauth*` to help insure the file is not
+       - The token should be stored in the same folder as the scripts, with the name `.
+    ghub_oauth_pr_review`
+       - `.gitignore` includes an entry for `.ghub_oauth*` to help insure the file is not
        committed to this repo.
+       - If no token is provided, the script will check for GitHub tokens in well-known 
+       environment variables GH_TOKEN and GITHUB_TOKEN
+4. If using GitLab:
+A GitLab auth token that gives permission to read the repo in question.
+   - The token should be stored in the same folder as the scripts, with the name `.
+ ghub_oauth_pr_review`
+   - `.gitignore` includes an entry for `.ghub_oauth*` to help insure the file is not
+  committed to this repo.
 
 ## Configuration
-As mentioned above, you must provide a `.ghub_oauth_pr_review` file with a GitHub 
-oauth token. 
+As mentioned above, you must provide a `.ghub_oauth_pr_review` and/or  `.
+glab_oauth_pr_review` depending on which platforms you use.
 
 The file `.codereview.config.default` included in this repo provides some basic 
 configuration values. Should you wish to override any of those, put your overrides into 
 a file called `.codereview.config`. 
 
+## Getting Started
+1. Install ruby if you don't already have it. [rbenv](https://github.com/rbenv/rbenv) 
+   highly recommended for managing ruby versions.
+2. `gem install bundler`
+3. `bundle install` or `bundle install --without gitlab_support`
+4. If using GitHub, install `gh` the GitHub client app. See [cli.github.com](https://cli.
+   github.com/)
+5. Configuration, especially auth tokens for the desired platforms. See above for more 
+   on configuration.
+
 ## Improvements
-These started as quick and dirty scripts for personal use only and have evolved 
+These started as quick and dirty bash scripts for personal use only and have evolved 
 in an ad hoc manner over the years, usually with quick and dirty fixes focused only
 on a particular current need. For wider use they'd probably benefit from, among other things:
 
 1. automated tests
 2. better option processing
-3. a help option
-4. bash linting
-5. maybe just a re-write 
+3. maybe just a re-write
+
+A port from the bash script to ruby in May 2025 may facilitate those improvements.

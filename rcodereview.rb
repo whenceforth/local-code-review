@@ -1,13 +1,23 @@
 #!/usr/bin/env ruby
 
-require 'git'
+require 'bundler/setup'
+
 require 'fileutils'
 require 'json'
 require 'open3' # For capturing stderr from system calls if needed
-begin
-  require 'gitlab' # For GitLab API interaction
-rescue LoadError
-  # Gitlab gem not used if not doing GitLab PR reviews, so only warn then.
+
+
+# Check Bundler group
+if Bundler.locked_gems.specs.any? { |s| s.groups.include?(:gitlab_support) && s.name == 'gitlab' }
+  begin
+    require 'gitlab'
+    puts "GitLab gem is available via Bundler group :gitlab_support."
+    # Use gitlab gem
+  rescue LoadError
+    puts "Error loading gitlab gem even though it's in a loaded group."
+  end
+else
+  puts "GitLab gem group :gitlab_support not installed."
 end
 
 # --- Configuration and Globals ---
@@ -498,7 +508,7 @@ def review_pr_gh(pr_num)
   fail_with_msg "Not a GitHub repository according to origin URL." unless REPO_DETAILS[:platform] == :github
 
   ensure_gh_authentication
-  
+
   output "Fetching PR info from GitHub API via gh CLI for PR ##{pr_num}..."
   api_command = "gh pr view #{pr_num} --json baseRefName,headRefName --repo \"#{REPO_DETAILS[:repo_path]}\""
   api_result_json, stderr_str, status = Open3.capture3(api_command)

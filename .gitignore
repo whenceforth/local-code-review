@@ -1,2 +1,3 @@
 .codereview.config
 .*oauth*
+Gemfile.lock
