@@ -4,12 +4,26 @@ require 'git'
 require 'fileutils'
 require 'json'
 require 'open3' # For capturing stderr from system calls if needed
+begin
+  require 'gitlab' # For GitLab API interaction
+rescue LoadError
+  # Gitlab gem not used if not doing GitLab PR reviews, so only warn then.
+end
 
 # --- Configuration and Globals ---
 SCRIPT_DIR = File.expand_path(File.dirname(__FILE__))
 CONFIG = {}
 DEFAULT_CONFIG_PATH = File.join(SCRIPT_DIR, '.codereview.config.default')
 OVERRIDE_CONFIG_PATH = File.join(SCRIPT_DIR, '.codereview.config')
+
+REPO_DETAILS = {
+  platform: nil,            # :github or :gitlab
+  host: nil,                # Actual hostname from URL
+  api_base_url: nil,        # e.g. https://api.github.com or https://gitlab.com/api/v4
+  repo_path: nil,           # Path part of the repo, e.g., "owner/project" or "group/subgroup/project"
+  project_name: nil,        # The last part of the repo_path, e.g., "project"
+  owner_or_group: nil       # "owner" for GitHub, "group/subgroup" for GitLab
+}
 
 # --- Logging ---
 def debug(message)
@@ -37,15 +51,21 @@ def load_config_file(file_path)
   File.foreach(file_path) do |line|
     line.strip!
     next if line.start_with?('#') || line.empty?
-
-    # Match export KEY=VALUE, export KEY="VALUE", KEY=VALUE, KEY="VALUE"
     if match = line.match(/^(?:export\s+)?([^=]+)=(.*)/)
       key = match[1].strip
-      value = match[2].strip.gsub(/^["']|["']$/, '') # Remove surrounding quotes
+      value = match[2].strip.gsub(/^["']|["']$/, '')
       loaded_cfg[key] = value
     end
   end
   loaded_cfg
+end
+
+def expand_config_path_if_present(config, name)
+  item = config[name]
+  return config unless item.to_s.length > 0
+
+  config[name] = File.expand_path(item)
+  config
 end
 
 def load_configuration
@@ -61,32 +81,34 @@ def load_configuration
     end
   end
 
-  scratch_dir_config = CONFIG['SCRATCH_DIR']
-  if scratch_dir_config
-    CONFIG['SCRATCH_DIR'] = File.expand_path(scratch_dir_config)
-  else
-    CONFIG['SCRATCH_DIR'] = File.join(ENV['HOME'], '.tmp', 'codereview')
-  end
-  CONFIG['SCRATCH_DIR'] ||= File.join(ENV['HOME'], '.tmp', 'codereview')
+  # GitHub defaults
+  # Set defaults if not in config OR if they are empty strings
+  CONFIG['GH_HOST'] = 'github.com' if CONFIG['GH_HOST'].to_s.empty?
 
-  # Set defaults if not in config
-  CONFIG['DEFAULT_TARGET_BRANCH'] ||= 'master'
-  CONFIG['DEFAULT_TEMP_BRANCH'] ||= 'review'
+  CONFIG['GH_API_BASE_URL'] = "https://api.#{CONFIG['GH_HOST']}" if CONFIG['GH_API_BASE_URL'].to_s.empty? # Standard for public/GHE
 
-  unless CONFIG['GL_API_ENDPOINT']
-    CONFIG['GL_API_ENDPOINT'] = ENV['GITLAB_API_ENDPOINT'] || 'https://gitlab.com/api/v4'
-  end
-  CONFIG['GL_API_ENDPOINT'] = CONFIG['GL_API_ENDPOINT'] || ENV['GITLAB_API_ENDPOINT'] || 'https://gitlab.com/api/v4'
-  CONFIG['GL_TOKEN_FILE'] = File.join(SCRIPT_DIR, '.glab_oauth_pr_review')
+  expand_config_path_if_present(CONFIG, 'GH_TOKEN_FILE')
+  CONFIG['GH_TOKEN_FILE'] = File.join(SCRIPT_DIR, '.ghub_oauth_pr_review') if CONFIG['GH_TOKEN_FILE'].to_s.empty?
+
+  # GitLab defaults
+  CONFIG['GL_HOST'] = 'gitlab.com' if CONFIG['GL_HOST'].to_s.empty?
+  CONFIG['GITLAB_API_ENDPOINT'] = "https://#{CONFIG['GL_HOST']}/api/v4" if CONFIG['GITLAB_API_ENDPOINT'].to_s.empty?
+
+  expand_config_path_if_present(CONFIG, 'GL_TOKEN_FILE')
+  CONFIG['GL_TOKEN_FILE'] = File.join(SCRIPT_DIR, '.glab_oauth_pr_review') if CONFIG['GL_TOKEN_FILE'].to_s.empty?
+
+  CONFIG['DEFAULT_TARGET_BRANCH'] = 'master' if CONFIG['DEFAULT_TARGET_BRANCH'].to_s.empty?
+  CONFIG['DEFAULT_TEMP_BRANCH'] = 'review' if CONFIG['DEFAULT_TEMP_BRANCH'].to_s.empty?
+
+  expand_config_path_if_present(CONFIG,'SCRATCH_DIR')
+  CONFIG['SCRATCH_DIR'] = File.join(ENV['HOME'], '.tmp', 'codereview') if CONFIG['SCRATCH_DIR'].to_s.empty?
 end
 
 def confirm_action
   return unless CONFIG['CR_CONFIRM'] && !CONFIG['CR_CONFIRM'].empty?
-
   print 'Do you want to continue? y/n: '
-  shall_we = $stdin.gets.chomp
-
-  unless %w[y Y].include?(shall_we)
+  shall_we = $stdin.gets.chomp.downcase
+  unless %w[y yes].include?(shall_we)
     output "exiting on choice of '#{shall_we}'"
     exit 1
   end
@@ -95,45 +117,86 @@ end
 
 # Memoization for git object
 @git_object = nil
-
 def g
   @git_object ||= Git.open(Dir.pwd) # Assumes running from within the repo
 rescue ArgumentError => e
   fail_with_msg "Not a git repository or git command not found: #{e.message}"
 end
 
-REPO_DETAILS = {} # To store owner and project
-
-def get_repo_owner_and_name
-  return if REPO_DETAILS[:owner] && REPO_DETAILS[:project] # Already fetched
+def get_platform_and_repo_details
+  return if REPO_DETAILS[:platform] # Already determined
 
   begin
     origin_url = g.remote('origin').url
-    debug "Original origin URL: #{origin_url}"
+    debug "Parsing origin URL: #{origin_url}"
   rescue Git::Error
     fail_with_msg "Could not get URL for remote 'origin'. Ensure 'origin' remote is configured."
   end
 
-  # Transform to common format for parsing
-  # git@github.com:owner/project.git -> git://github.com/owner/project.git
-  # https://github.com/owner/project.git -> https://github.com/owner/project.git
-  common_format = origin_url.sub(/^git@([^:]+):/, 'git://\1/')
-                            .sub(/^https:\/\//, 'https---') # temp for tr
-                            .tr(':', '/')
-                            .sub(/^https---/, 'https://')
+  repo_host = nil
+  repo_path_match = nil
 
-  parts = common_format.split('/')
-  # For git://github.com/owner/project.git -> parts are git, '', github.com, owner, project.git
-  # For https://github.com/owner/project.git -> parts are https, '', github.com, owner, project.git
-  if parts.length >= 5
-    REPO_DETAILS[:owner] = parts[-2]
-    REPO_DETAILS[:project] = parts[-1].sub(/\.git$/, '')
+  if origin_url.match(%r{^(?:git@|https?://)([^:/]+)[:/](.+?)(?:\.git)?$})
+    # Matches:
+    # git@github.com:owner/project.git  -> host=github.com, path=owner/project
+    # https://github.com/owner/project.git -> host=github.com, path=owner/project
+    # git@gitlab.example.com:group/subgroup/project.git -> host=gitlab.example.com, path=group/subgroup/project
+    # https://gitlab.example.com/group/subgroup/project.git -> host=gitlab.example.com, path=group/subgroup/project
+    repo_host = $1
+    repo_path_match = $2
   else
-    fail_with_msg "Could not parse owner and project from URL: #{origin_url} (parsed as #{common_format})"
+    fail_with_msg "Could not parse host and path from origin URL: #{origin_url}"
   end
 
-  debug "get_repo_owner_and_name: OWNER=#{REPO_DETAILS[:owner]}, PROJECT=#{REPO_DETAILS[:project]}"
+  REPO_DETAILS[:host] = repo_host.downcase
+  REPO_DETAILS[:repo_path] = repo_path_match
+
+  # Determine platform
+  gh_host_config = CONFIG['GH_HOST']&.downcase
+  gl_host_config = CONFIG['GL_HOST']&.downcase
+
+  if REPO_DETAILS[:host] == gh_host_config || (gh_host_config == "github.com" && REPO_DETAILS[:host] == "github.com")
+    REPO_DETAILS[:platform] = :github
+    REPO_DETAILS[:api_base_url] = CONFIG['GH_API_BASE_URL']
+    parts = REPO_DETAILS[:repo_path].split('/')
+    REPO_DETAILS[:owner_or_group] = parts.length > 1 ? parts[0...-1].join('/') : nil # Could be just owner, or empty if repo is at root (rare for GH)
+    REPO_DETAILS[:project_name] = parts.last
+  elsif REPO_DETAILS[:host] == gl_host_config || (gl_host_config == "gitlab.com" && REPO_DETAILS[:host] == "gitlab.com")
+    REPO_DETAILS[:platform] = :gitlab
+    REPO_DETAILS[:api_base_url] = CONFIG['GITLAB_API_ENDPOINT']
+    # For GitLab, repo_path is usually "group/subgroup/project"
+    REPO_DETAILS[:owner_or_group] = File.dirname(REPO_DETAILS[:repo_path]) unless REPO_DETAILS[:repo_path].count('/') == 0
+    REPO_DETAILS[:owner_or_group] = nil if REPO_DETAILS[:owner_or_group] == '.'
+    REPO_DETAILS[:project_name] = File.basename(REPO_DETAILS[:repo_path])
+  else
+    fail_with_msg "Origin URL host '#{REPO_DETAILS[:host]}' does not match configured GH_HOST ('#{gh_host_config}') or GL_HOST ('#{gl_host_config}')."
+  end
+
+  debug "Platform detection: #{REPO_DETAILS.inspect}"
 end
+
+
+REPO_DETAILS_LEGACY = {} # To store owner and project for bash script compatibility
+def get_repo_owner_and_name_legacy_compat
+  return if REPO_DETAILS_LEGACY[:owner] && REPO_DETAILS_LEGACY[:project]
+  get_platform_and_repo_details # Ensure new detection runs
+
+  if REPO_DETAILS[:platform] == :github
+    # For GitHub, owner_or_group is typically the owner, repo_path is owner/project
+    path_parts = REPO_DETAILS[:repo_path].split('/')
+    REPO_DETAILS_LEGACY[:owner] = path_parts.first if path_parts.length > 1
+    REPO_DETAILS_LEGACY[:project] = path_parts.last
+  elsif REPO_DETAILS[:platform] == :gitlab
+    # For GitLab, owner_or_group can be group/subgroup, repo_path is group/subgroup/project
+    # This mapping is imperfect for "owner" but "project" should be fine.
+    REPO_DETAILS_LEGACY[:owner] = REPO_DETAILS[:owner_or_group] # This will be the full group path
+    REPO_DETAILS_LEGACY[:project] = REPO_DETAILS[:project_name]
+  else
+    fail_with_msg "Cannot determine legacy owner/project for unknown platform."
+  end
+  debug "get_repo_owner_and_name_legacy_compat: OWNER=#{REPO_DETAILS_LEGACY[:owner]}, PROJECT=#{REPO_DETAILS_LEGACY[:project]}"
+end
+
 
 def get_project_base_dir_name
   return REPO_DETAILS[:project_base_dir_name] if REPO_DETAILS[:project_base_dir_name]
@@ -149,46 +212,30 @@ end
 
 def get_branch_info(branch_name)
   branch_info = { 'branch' => branch_name }
-
   begin
-    local_branch = g.branch(branch_name)
-    # Note: g.branch(branch_name).config('merge') is not available in the gem.
-    # We use g.config directly.
     tracking_ref = g.config("branch.#{branch_name}.merge")
-    remote_name = g.config("branch.#{branch_name}.remote")
+    remote_name  = g.config("branch.#{branch_name}.remote")
 
-    if tracking_ref.nil? || tracking_ref.empty?
-      debug "get_branch_info: No tracking info for local branch '#{branch_name}'. Fetching 'origin #{branch_name}' to update remote-tracking branch."
-      # This fetches the branch <branch_name> from origin to origin/<branch_name>
-      # It does not set up local tracking if it wasn't already there.
+    if (tracking_ref.nil? || tracking_ref.empty?) && (remote_name.nil? || remote_name.empty?)
+      debug "get_branch_info: No local tracking info for '#{branch_name}'. Assuming 'origin' and fetching 'origin #{branch_name}'."
+      remote_name = 'origin' # Default to origin if not configured
       begin
-        g.fetch('origin', ref: branch_name) # Fetches refs/heads/branch_name from origin
+        g.fetch(remote_name, ref: branch_name)
       rescue Git::Error => e
-        debug "Fetch failed for origin/#{branch_name}: #{e.message}. This might be okay if the branch doesn't exist on origin."
+        debug "Fetch failed for #{remote_name}/#{branch_name}: #{e.message}. This might be okay if the branch doesn't exist on remote."
       end
-      # Re-check config (though fetch itself doesn't alter this local config)
-      tracking_ref = g.config("branch.#{branch_name}.merge")
-      remote_name = g.config("branch.#{branch_name}.remote")
-      debug "get_branch_info: After fetching, tracking=#{tracking_ref}"
+      tracking_ref = g.config("branch.#{branch_name}.merge") # Re-check
+      remote_name_check = g.config("branch.#{branch_name}.remote")
+      remote_name = remote_name_check if remote_name_check && !remote_name_check.empty?
     end
-
     branch_info['tracking'] = tracking_ref
     branch_info['remote'] = remote_name
-
-    if remote_name && !remote_name.empty?
-      branch_info['remote_url'] = g.remote(remote_name).url
-    else
-      # Fallback to 'origin' if specific remote for branch is not found/set
-      branch_info['remote_url'] = g.remote('origin')&.url
-    end
-
+    branch_info['remote_url'] = g.remote(remote_name || 'origin')&.url if remote_name || g.remotes.map(&:name).include?('origin')
   rescue Git::Error => e
     debug "get_branch_info: Could not get full git config for branch #{branch_name}: #{e.message}"
-    # Attempt to get at least the remote URL for origin if parts failed
-    branch_info['remote_url'] ||= g.remote('origin')&.url
+    branch_info['remote_url'] ||= g.remote('origin')&.url if g.remotes.map(&:name).include?('origin')
   end
-
-  debug "get_branch_info: branch_name=#{branch_name}, tracking=#{branch_info['tracking']}, remote=#{branch_info['remote']}, remote_url=#{branch_info['remote_url']}"
+  debug "get_branch_info results: #{branch_info.inspect}"
   branch_info
 end
 
@@ -197,26 +244,27 @@ def get_current_branch_name
 end
 
 CR_DATA_DETAILS = {}
-
 def get_branch_data_dir_and_file(scratch_dir_base)
-  return if CR_DATA_DETAILS[:file_path] # Already calculated
+  return if CR_DATA_DETAILS[:file_path]
 
-  get_repo_owner_and_name # Ensures REPO_DETAILS[:project] is populated
-  project_name = REPO_DETAILS[:project]
-  project_base_dir = get_project_base_dir_name
+  get_platform_and_repo_details # Ensures REPO_DETAILS[:project_name] is populated
+  # Use the specific project name from the platform details for directory naming
+  project_identifier_for_file = REPO_DETAILS[:project_name]
+  fail_with_msg "Could not determine project name for data file path." if project_identifier_for_file.nil? || project_identifier_for_file.empty?
 
-  CR_DATA_DETAILS[:dir_path] = File.join(scratch_dir_base, project_name)
-  # Using PROJECT_BASE_DIR_NAME as the filename
-  CR_DATA_DETAILS[:file_path] = File.join(CR_DATA_DETAILS[:dir_path], "#{project_base_dir}.txt")
+  project_base_dir = get_project_base_dir_name # Local directory name
 
-  info "get_branch_data_dir_and_file: PROJECT=#{project_name}, CR_DATA_DIR=#{CR_DATA_DETAILS[:dir_path]}, CR_DATA_FILE=#{CR_DATA_DETAILS[:file_path]}"
+  CR_DATA_DETAILS[:dir_path] = File.join(scratch_dir_base, project_identifier_for_file) # Use actual project name
+  CR_DATA_DETAILS[:file_path] = File.join(CR_DATA_DETAILS[:dir_path], "#{project_base_dir}.txt") # Local unique file
+
+  info "get_branch_data_dir_and_file: PROJECT_FOR_DIR=#{project_identifier_for_file}, CR_DATA_DIR=#{CR_DATA_DETAILS[:dir_path]}, CR_DATA_FILE=#{CR_DATA_DETAILS[:file_path]}"
   debug "get_branch_data_dir_and_file: CR_DATA_FILE=#{CR_DATA_DETAILS[:file_path]}"
 end
+
 
 def store_current_branch_name(scratch_dir_base = CONFIG['SCRATCH_DIR'])
   get_branch_data_dir_and_file(scratch_dir_base)
   current_branch = get_current_branch_name
-
   debug "store_current_branch_name: CR_DATA_FILE=#{CR_DATA_DETAILS[:file_path]}"
   FileUtils.mkdir_p(CR_DATA_DETAILS[:dir_path])
   File.write(CR_DATA_DETAILS[:file_path], current_branch)
@@ -226,7 +274,6 @@ end
 def read_stored_branch_name(scratch_dir_base = CONFIG['SCRATCH_DIR'])
   get_branch_data_dir_and_file(scratch_dir_base)
   debug "read_stored_branch_name: CR_DATA_FILE=#{CR_DATA_DETAILS[:file_path]}"
-
   stored_branch = CONFIG['DEFAULT_TARGET_BRANCH'] # Default
   if File.exist?(CR_DATA_DETAILS[:file_path])
     stored_branch = File.read(CR_DATA_DETAILS[:file_path]).strip
@@ -247,21 +294,34 @@ def delete_stored_branch_name(scratch_dir_base = CONFIG['SCRATCH_DIR'])
   end
 end
 
+def system_must_succeed(command, show_output: true, allow_fail_message: nil)
+  output "Executing: #{command}" if show_output && CONFIG['CR_LOG_DEBUG'] == '1' # Only show command if debug
+  stdout_str, stderr_str, status = Open3.capture3(command)
+
+  # Always show output if command produces any, regardless of debug level, unless show_output is false.
+  if show_output
+    puts stdout_str unless stdout_str.empty?
+    warn stderr_str unless stderr_str.empty?
+  end
+
+  unless status.success?
+    message = "Command failed with status #{status.exitstatus}: #{command}\nSTDERR: #{stderr_str.strip}"
+    message = "#{allow_fail_message}\n#{message}" if allow_fail_message
+    fail_with_msg(message)
+  end
+  stdout_str
+end
+
 # --- Main Commands ---
 def review_branch(feature_branch, target_branch = nil, temp_branch = nil)
   fail_with_msg "review_branch: must specify branch to review (FEATURE_BRANCH)" if feature_branch.nil? || feature_branch.empty?
-
   target_branch ||= CONFIG['DEFAULT_TARGET_BRANCH']
-  temp_branch ||= CONFIG['DEFAULT_TEMP_BRANCH']
-
+  temp_branch   ||= CONFIG['DEFAULT_TEMP_BRANCH']
   debug "review_branch: FEATURE_BRANCH=#{feature_branch}, TARGET_BRANCH=#{target_branch}, TEMP_BRANCH=#{temp_branch}"
   confirm_action
-
   store_current_branch_name(CONFIG['SCRATCH_DIR'])
 
-  # Save any outstanding changes
   begin
-    # Check if there are changes to stash
     status = g.status
     has_changes = status.changed.any? || status.added.any? || status.deleted.any? || status.untracked.any?
     if has_changes
@@ -271,9 +331,6 @@ def review_branch(feature_branch, target_branch = nil, temp_branch = nil)
       info "No local changes to stash."
     end
   rescue Git::Error => e
-    # stash_save might fail if there's nothing to stash, depending on git version/config
-    # The git gem handles "No local changes to save" gracefully.
-    # If it's another error, we should report it.
     unless e.message.include?("No local changes to save")
       fail_with_msg "Failed to git stash save: #{e.message}"
     end
@@ -281,146 +338,86 @@ def review_branch(feature_branch, target_branch = nil, temp_branch = nil)
   end
 
   target_branch_info = get_branch_info(target_branch)
-
-  # Get latest code for TARGET_BRANCH
-  if target_branch_info['remote'] && !target_branch_info['remote'].empty?
-    begin
-      info "Fetching remote '#{target_branch_info['remote']}' for TARGET_BRANCH=#{target_branch}"
-      # g.remote(target_branch_info['remote']).fetch # Fetches all from that remote
-      system_must_succeed("git fetch #{target_branch_info['remote']} #{target_branch}")
-    rescue Git::Error => e
-      fail_with_msg "git fetch for remote '#{target_branch_info['remote']}' for TARGET_BRANCH=#{target_branch} failed: #{e.message}"
-    end
-  end
-
-  begin
-    info "Checking out TARGET_BRANCH=#{target_branch}"
-    g.checkout(target_branch)
-  rescue Git::Error => e
-    fail_with_msg "git checkout for TARGET_BRANCH=#{target_branch} failed: #{e.message}"
-  end
-
-  if target_branch_info['remote'] && !target_branch_info['remote'].empty? && target_branch_info['tracking'] && !target_branch_info['tracking'].empty?
-    begin
-      info "Pulling remote '#{target_branch_info['remote']}' for TARGET_BRANCH=#{target_branch}"
-      # g.pull(target_branch_info['remote'], target_branch) # This might try to pull the remote's "target_branch" name
-      system_must_succeed("git pull #{target_branch_info['remote']} #{target_branch}")
-    rescue Git::Error => e
-      fail_with_msg "git pull for remote '#{target_branch_info['remote']}' for TARGET_BRANCH=#{target_branch} failed: #{e.message}"
-    end
-  end
+  target_remote = target_branch_info['remote'] || 'origin'
+  info "Fetching remote '#{target_remote}' for TARGET_BRANCH=#{target_branch}"
+  system_must_succeed("git fetch #{target_remote} #{target_branch}")
+  info "Checking out TARGET_BRANCH=#{target_branch}"
+  g.checkout(target_branch)
+  info "Pulling remote '#{target_remote}' for TARGET_BRANCH=#{target_branch}"
+  system_must_succeed("git pull #{target_remote} #{target_branch}")
 
   feature_branch_info = get_branch_info(feature_branch)
+  feature_remote = feature_branch_info['remote'] || 'origin'
+  info "Fetching remote '#{feature_remote}' for FEATURE_BRANCH=#{feature_branch}"
+  system_must_succeed("git fetch #{feature_remote} #{feature_branch}")
+  info "Checking out FEATURE_BRANCH=#{feature_branch}"
+  g.checkout(feature_branch)
+  info "Pulling remote '#{feature_remote}' for FEATURE_BRANCH=#{feature_branch}"
+  system_must_succeed("git pull #{feature_remote} #{feature_branch}")
 
-  # Get a local copy of the branch to be reviewed
-  if feature_branch_info['remote'] && !feature_branch_info['remote'].empty?
-    begin
-      info "Fetching remote '#{feature_branch_info['remote']}' for FEATURE_BRANCH=#{feature_branch}"
-      # g.remote(feature_branch_info['remote']).fetch
-      system_must_succeed("git fetch #{feature_branch_info['remote']} #{feature_branch}")
-    rescue Git::Error => e
-      fail_with_msg "git fetch for remote '#{feature_branch_info['remote']}' for FEATURE_BRANCH=#{feature_branch} failed: #{e.message}"
-    end
-  end
-
-  begin
-    info "Checking out FEATURE_BRANCH=#{feature_branch}"
-    g.checkout(feature_branch)
-  rescue Git::Error => e
-    fail_with_msg "git checkout #{feature_branch} failed: #{e.message}"
-  end
-
-  if feature_branch_info['remote'] && !feature_branch_info['remote'].empty? && feature_branch_info['tracking'] && !feature_branch_info['tracking'].empty?
-    begin
-      info "Pulling remote '#{feature_branch_info['remote']}' for FEATURE_BRANCH=#{feature_branch}"
-      # g.pull(feature_branch_info['remote'], feature_branch)
-      system_must_succeed("git pull #{feature_branch_info['remote']} #{feature_branch}")
-    rescue Git::Error => e
-      fail_with_msg "git pull for remote '#{feature_branch_info['remote']}' for FEATURE_BRANCH=#{feature_branch} failed: #{e.message}"
-    end
-  end
-
-  # Now make a copy of TARGET_BRANCH to preview the merge with.
   info "Checking out TARGET_BRANCH=#{target_branch} again to create temp branch"
   g.checkout(target_branch)
 
-  # Delete any older review branch
   if g.branches.local.map(&:name).include?(temp_branch)
-    begin
-      info "Deleting old temp branch '#{temp_branch}'"
-      g.branch(temp_branch).delete(force: true)
-    rescue Git::Error => e
-      info "Could not delete old temp branch '#{temp_branch}' (may not exist or other issue): #{e.message}"
+    info "Attempting to delete old temp branch '#{temp_branch}' via system call..."
+    _stdout_str, stderr_str, status = Open3.capture3("git branch -D \"#{temp_branch}\"")
+    if status.success?
+      info "Successfully deleted old temp branch '#{temp_branch}'."
+    else
+      if stderr_str.match(/branch.*not found/i)
+        info "Old temp branch '#{temp_branch}' was listed by gem but not found by CLI for deletion, or already gone."
+      else
+        info "Command `git branch -D \"#{temp_branch}\"` failed with: #{stderr_str.strip}. Continuing..."
+      end
     end
   else
-    info "No previous work branch found (using #{temp_branch})"
+    info "No previous temp branch '#{temp_branch}' found (checked via gem API)."
   end
 
-  # Create a new work branch
-  begin
-    info "Creating new temp branch '#{temp_branch}' from '#{target_branch}'"
-    g.branch(temp_branch).create
-    g.checkout(temp_branch)
-  rescue Git::Error => e
-    fail_with_msg "git checkout -b #{temp_branch} failed: #{e.message}"
-  end
+  info "Creating new temp branch '#{temp_branch}' from '#{target_branch}'"
+  g.branch(temp_branch).create
+  g.checkout(temp_branch)
 
   # Apply changes without committing. View diffs in IDE
   # The `git` gem's merge method auto-commits. We need to shell out for --no-commit.
   info "Merging #{feature_branch} into #{temp_branch} with --no-commit --no-ff"
   merge_command = "git merge --no-commit --no-ff \"#{feature_branch}\""
-  output "Executing: #{merge_command}"
-  system(merge_command) # We don't use system_must_succeed as merge can have conflicts
-
-  # Check $?.success? for merge result. The bash script fails on merge error.
+  output "Executing: #{merge_command}" # Show this specific command
+  system(merge_command)
   unless $?.success?
-    # A merge can "fail" (return non-zero) due to conflicts, which is expected for a preview.
-    # The original script uses `|| fail_with_msg`. If a real error (not just conflict) occurs,
-    # it's harder to distinguish here without parsing `git merge` output.
-    # For now, we'll just warn. User should check status.
     output "WARN: `git merge --no-commit` exited with code #{$?.exitstatus}. This might indicate merge conflicts to review."
   end
 
-  output ""
-  output "git status: "
-  output ""
-  system("git status") # Using system for rich output
-
-  output ""
-  output ""
-  output "FEATURE_BRANCH=#{feature_branch}, TARGET_BRANCH=#{target_branch}, TEMP_BRANCH=#{temp_branch}"
-  output ""
-  output "When finished with review, you can discard the preview merge by running:"
-  output "             #{File.join(SCRIPT_DIR, File.basename($0))} finished"
-  output ""
+  output "\nStatus after attempted merge:\n"
+  system("git status")
+  output "\nFEATURE_BRANCH=#{feature_branch}, TARGET_BRANCH=#{target_branch}, TEMP_BRANCH=#{temp_branch}"
+  output "\nWhen finished with review, you can discard the preview merge by running:"
+  output "             #{File.join(SCRIPT_DIR, File.basename($0))} finished\n"
 end
 
 def review_pr_gh(pr_num)
-  fail_with_msg "PR Number not provided" if pr_num.nil? || pr_num.empty?
-  get_repo_owner_and_name # Populates REPO_DETAILS
-  owner = REPO_DETAILS[:owner]
-  project = REPO_DETAILS[:project]
-  gh_host = CONFIG['GH_HOST']
+  # Ensure REPO_DETAILS is populated for GitHub
+  fail_with_msg "Not a GitHub repository according to origin URL." unless REPO_DETAILS[:platform] == :github
 
-  info "review_pr_gh: OWNER=#{owner}, PROJECT=#{project}, GH_HOST=#{gh_host}"
-
-  token_file = File.join(SCRIPT_DIR, '.ghub_oauth_pr_review')
-  info "review_pr_gh: token_file=#{token_file}"
+  gh_host_for_cli = REPO_DETAILS[:host] == 'github.com' ? '' : "--hostname \"#{REPO_DETAILS[:host]}\""
+  token_file = CONFIG['GH_TOKEN_FILE']
   fail_with_msg "GitHub token file not found: #{token_file}" unless File.exist?(token_file)
 
-  auth_command = "gh auth login --with-token < \"#{token_file}\""
-  auth_command = "gh auth login --hostname \"#{gh_host}\" --with-token < \"#{token_file}\"" if gh_host && !gh_host.empty?
-
-  output "Authenticating with gh CLI..."
-  system_must_succeed(auth_command, show_output: false) # Don't show token success message directly
+  output "Authenticating with gh CLI for host '#{REPO_DETAILS[:host]}'..."
+  # TODO: Use gh auth status
+  # `gh auth login` can be interactive or error if already logged in.
+  # Consider `gh auth status` or just letting `gh pr view` use existing auth / env vars.
+  # Forcing login with token might be too intrusive if gh is already configured.
+  # Let's rely on gh being pre-configured or `GH_TOKEN` env var.
+  # system_must_succeed("gh auth login #{gh_host_for_cli} --with-token < \"#{token_file}\"", show_output: false)
+  info "Assuming 'gh' CLI is authenticated or GH_TOKEN is set. Using token file for reference: #{token_file}"
 
   output "Fetching PR info from GitHub API via gh CLI for PR ##{pr_num}..."
-  # Using Open3 to capture stdout and stderr for better error reporting
-  api_command = "gh pr view #{pr_num} --json baseRefName,headRefName --repo \"#{owner}/#{project}\""
+  api_command = "gh pr view #{pr_num} --json baseRefName,headRefName --repo \"#{REPO_DETAILS[:repo_path]}\""
   api_result_json, stderr_str, status = Open3.capture3(api_command)
 
   unless status.success?
-    fail_with_msg "gh client call failed for PR ##{pr_num} on repo #{owner}/#{project}: #{stderr_str}"
+    fail_with_msg "gh client call failed for PR ##{pr_num} on repo #{REPO_DETAILS[:repo_path]}: #{stderr_str}"
   end
 
   begin
@@ -435,26 +432,73 @@ def review_pr_gh(pr_num)
   fail_with_msg "GitHub API call failed to return head branch (FROM): api_result=#{api_result_json}" if from_branch.nil? || from_branch.empty? || from_branch == "null"
   fail_with_msg "GitHub API call failed to return base branch (TO): api_result=#{api_result_json}" if to_branch.nil? || to_branch.empty? || to_branch == "null"
 
-  info "FROM (head): #{from_branch}, TO (base): #{to_branch}"
+  info "GitHub PR ##{pr_num}: FROM (head): #{from_branch}, TO (base): #{to_branch}"
   review_branch(from_branch, to_branch, CONFIG['DEFAULT_TEMP_BRANCH'])
 end
 
-def review_finished(restore_branch_override = nil, temp_branch_override = nil)
-  # set -o xtrace equivalent can be very verbose; skipping for now.
-  # Can add `set -x` to system calls if needed for specific commands.
+def review_pr_gl(mr_iid)
+  fail_with_msg "Not a GitLab repository according to origin URL." unless REPO_DETAILS[:platform] == :gitlab
+  unless defined?(Gitlab)
+    fail_with_msg "GitLab gem is not loaded. Please install it (`gem install gitlab`) and ensure it's in your Gemfile if using Bundler."
+  end
 
+  token_file = CONFIG['GL_TOKEN_FILE']
+  fail_with_msg "GitLab token file not found: #{token_file}" unless File.exist?(token_file) && File.readable?(token_file)
+  private_token = File.read(token_file).strip
+  fail_with_msg "GitLab token is empty in #{token_file}." if private_token.empty?
+
+  begin
+    Gitlab.configure do |config|
+      config.endpoint       = REPO_DETAILS[:api_base_url] # From get_platform_and_repo_details
+      config.private_token  = private_token
+    end
+    debug "GitLab client configured for endpoint: #{Gitlab.endpoint}"
+
+    # REPO_DETAILS[:repo_path] should be "group/project" or "group/subgroup/project"
+    project_identifier = REPO_DETAILS[:repo_path]
+    output "Fetching MR info from GitLab API for MR !#{mr_iid} in project '#{project_identifier}'..."
+
+    mr = Gitlab.merge_request(project_identifier, mr_iid)
+    from_branch = mr.source_branch
+    to_branch = mr.target_branch
+
+  rescue Gitlab::Error::Unauthorized => e
+    fail_with_msg "GitLab API Error: Unauthorized. Check your token and endpoint. #{e.message}"
+  rescue Gitlab::Error::NotFound => e
+    fail_with_msg "GitLab API Error: Merge Request !#{mr_iid} or Project '#{project_identifier}' not found. #{e.message}"
+  rescue Gitlab::Error => e # Catch other Gitlab errors
+    fail_with_msg "GitLab API Error: #{e.class} - #{e.message}"
+  rescue StandardError => e # Catch other unexpected errors like network issues
+    fail_with_msg "An unexpected error occurred while fetching GitLab MR: #{e.message}"
+  end
+
+  fail_with_msg "GitLab API call failed to return source branch for MR !#{mr_iid}" if from_branch.nil? || from_branch.empty?
+  fail_with_msg "GitLab API call failed to return target branch for MR !#{mr_iid}" if to_branch.nil? || to_branch.empty?
+
+  info "GitLab MR !#{mr_iid}: FROM (source): #{from_branch}, TO (target): #{to_branch}"
+  review_branch(from_branch, to_branch, CONFIG['DEFAULT_TEMP_BRANCH'])
+end
+
+def dispatch_review_pr(identifier)
+  get_platform_and_repo_details # This will determine :platform and :repo_path
+
+  case REPO_DETAILS[:platform]
+  when :github
+    review_pr_gh(identifier)
+  when :gitlab
+    review_pr_gl(identifier)
+  else
+    fail_with_msg "Could not determine Git hosting platform (GitHub/GitLab) from remote 'origin' URL or configuration."
+  end
+end
+
+def review_finished(restore_branch_override = nil, temp_branch_override = nil)
   stored_branch_name = read_stored_branch_name(CONFIG['SCRATCH_DIR'])
   restore_branch = restore_branch_override || stored_branch_name
   temp_branch = temp_branch_override || CONFIG['DEFAULT_TEMP_BRANCH']
-
-  can_delete_stored_file = false # Only delete if we successfully used the stored name and no override was given
-
-  if restore_branch_override.nil? && (stored_branch_name && !stored_branch_name.empty? && stored_branch_name != CONFIG['DEFAULT_TARGET_BRANCH'])
-    can_delete_stored_file = true
-  end
+  can_delete_stored_file = restore_branch_override.nil? && (stored_branch_name && !stored_branch_name.empty? && stored_branch_name != CONFIG['DEFAULT_TARGET_BRANCH'])
 
   if restore_branch.nil? || restore_branch.empty?
-    # Fallback: try to get default branch from remote 'origin'
     begin
       default_remote_head = `git remote show origin | grep 'HEAD branch' | cut -d' ' -f5`.strip
       restore_branch = default_remote_head unless default_remote_head.empty?
@@ -462,7 +506,6 @@ def review_finished(restore_branch_override = nil, temp_branch_override = nil)
       fail_with_msg "git command not found to determine default remote head."
     end
   end
-
   fail_with_msg "Unable to determine RESTORE_BRANCH" if restore_branch.nil? || restore_branch.empty?
   output "RESTORE_BRANCH=#{restore_branch}"
 
@@ -474,49 +517,29 @@ def review_finished(restore_branch_override = nil, temp_branch_override = nil)
     fail_with_msg "Expected current branch: #{temp_branch}. Actual current branch: #{current_actual_branch}. Aborting."
   end
   output "review_finished: TEMP_BRANCH=#{temp_branch}, RESTORE_BRANCH=#{restore_branch}"
-
   confirm_action
 
-  # Abort any uncommitted merge (from --no-commit)
-  # `git merge --abort` is the most reliable way.
-  info "Attempting to abort any uncommitted merge..."
+  info "Attempting to abort any uncommitted merge (on branch '#{current_actual_branch}')..."
   system_must_succeed("git merge --abort", allow_fail_message: "Merge abort failed (maybe nothing to abort, or already committed).")
 
   restore_branch_info = get_branch_info(restore_branch)
+  restore_remote = restore_branch_info['remote'] || 'origin'
 
-  if restore_branch_info['remote'] && !restore_branch_info['remote'].empty?
-    begin
-      info "Fetching remote '#{restore_branch_info['remote']}' for RESTORE_BRANCH=#{restore_branch}"
-      system_must_succeed("git fetch #{restore_branch_info['remote']} #{restore_branch}")
-    rescue StandardError => e # Catch StandardError from system_must_succeed
-      fail_with_msg "git fetch for remote '#{restore_branch_info['remote']}' for RESTORE_BRANCH=#{restore_branch} failed: #{e.message}"
-    end
-  end
+  info "Fetching remote '#{restore_remote}' for RESTORE_BRANCH=#{restore_branch}"
+  system_must_succeed("git fetch #{restore_remote} #{restore_branch}")
 
-  begin
-    info "Checking out RESTORE_BRANCH=#{restore_branch}"
-    g.checkout(restore_branch)
-  rescue Git::Error => e
-    fail_with_msg "git checkout #{restore_branch} failed: #{e.message}"
-  end
+  info "Checking out RESTORE_BRANCH=#{restore_branch}"
+  g.checkout(restore_branch)
 
-  if restore_branch_info['remote'] && !restore_branch_info['remote'].empty? && restore_branch_info['tracking'] && !restore_branch_info['tracking'].empty?
-    begin
-      info "Pulling remote '#{restore_branch_info['remote']}' for RESTORE_BRANCH=#{restore_branch}"
-      system_must_succeed("git pull #{restore_branch_info['remote']} #{restore_branch}")
-    rescue StandardError => e
-      fail_with_msg "git pull for remote '#{restore_branch_info['remote']}' for RESTORE_BRANCH=#{restore_branch} failed: #{e.message}"
-    end
-  end
+  info "Pulling remote '#{restore_remote}' for RESTORE_BRANCH=#{restore_branch}"
+  system_must_succeed("git pull #{restore_remote} #{restore_branch}")
 
-  # Try to pop the stash if one was made by this script (more robust check needed for specific stash)
-  # For simplicity, just trying to pop the latest. A more robust solution would save stash reference.
   begin
     latest_stash = g.stashes.latest
     if latest_stash && latest_stash.message.include?("codereview_autostash")
       info "Attempting to apply stashed changes..."
-      g.stashes.apply # Or g.stashes.pop to remove it
-      info "Stash applied. You may need to run `git stash drop` if it was a simple apply."
+      g.stashes.apply
+      info "Stash applied. You may need to run `git stash drop` if it was a simple apply and you wish to remove it."
     end
   rescue Git::Error => e
     info "Could not apply stash (maybe no stash or conflicts): #{e.message}"
@@ -524,49 +547,24 @@ def review_finished(restore_branch_override = nil, temp_branch_override = nil)
     info "No stashes found to apply."
   end
 
-  if can_delete_stored_file
-    delete_stored_branch_name(CONFIG['SCRATCH_DIR'])
-  else
-    debug "Not deleting stored branch name file (override used or was default)."
-  end
+  delete_stored_branch_name(CONFIG['SCRATCH_DIR']) if can_delete_stored_file
 
+  # Force delete the temp_branch
   if g.branches.local.map(&:name).include?(temp_branch)
-    begin
-      info "Deleting temp branch '#{temp_branch}'"
-      branch_del_cmd = "git branch -D #{temp_branch}"
-      system_must_succeed(branch_del_cmd, allow_fail_message: "Failed to delete temp branch '#{temp_branch}'.")
-    rescue Git::Error => e
-      fail_with_msg "git branch -D #{temp_branch} failed: #{e.message}"
-    end
+    info "Deleting temp branch '#{temp_branch}' via system call..."
+    system_must_succeed("git branch -D \"#{temp_branch}\"")
   else
-    info "Temp branch '#{temp_branch}' not found for deletion."
+    info "Temp branch '#{temp_branch}' not found for deletion (checked via gem API)."
   end
   output "Review finished. Restored to #{restore_branch}."
-end
-
-def system_must_succeed(command, show_output: true, allow_fail_message: nil)
-  output "Executing: #{command}" if show_output
-  stdout_str, stderr_str, status = Open3.capture3(command)
-
-  if show_output
-    puts stdout_str unless stdout_str.empty?
-    warn stderr_str unless stderr_str.empty? # To stderr
-  end
-
-  unless status.success?
-    message = "Command failed with status #{status.exitstatus}: #{command}\n#{stderr_str}"
-    message = "#{allow_fail_message}\n#{message}" if allow_fail_message
-    fail_with_msg(message)
-  end
-  stdout_str # Return stdout for potential further use
 end
 
 def print_help
   output "Usage: #{$0} <command> [options]"
   output "Commands:"
-  output "  pr <pr_number>              - Prepares a review for a GitHub Pull Request using 'gh' CLI."
+  output "  pr <pr_or_mr_number>        - Prepares a review for a GitHub PR or GitLab MR."
   output "  branch <feature_branch> [target_branch] [temp_branch] - Prepares a review for a feature branch."
-  output "  finished [restore_branch] [temp_branch] - Cleans up after a review and restores the original branch."
+  output "  finished [restore_branch] [temp_branch] - Cleans up and restores original branch."
   output "  help                        - Shows this help message."
   output "\nConfiguration is read from '.codereview.config.default' and '.codereview.config'."
   output "Key config options (can be set in config files):"
@@ -586,9 +584,13 @@ if __FILE__ == $0
   command = ARGV.shift
   case command
   when 'pr'
-    pr_num = ARGV.shift
-    fail_with_msg "PR number is required for 'pr' command." unless pr_num
-    review_pr_gh(pr_num)
+    identifier = ARGV.shift
+    # IID stands for Internal ID.
+    # While GitHub uses "Pull Request number" (which is unique within a repository),
+    # GitLab uses "Internal ID" (IID) for its Merge Requests. The IID is also unique
+    # within a single repository/project.
+    fail_with_msg "PR/MR number or IID is required for 'pr' command." unless identifier
+    dispatch_review_pr(identifier)
   when 'branch'
     feature_branch = ARGV.shift
     target_branch = ARGV.shift # optional
@@ -596,9 +598,9 @@ if __FILE__ == $0
     fail_with_msg "Feature branch name is required for 'branch' command." unless feature_branch
     review_branch(feature_branch, target_branch, temp_branch)
   when 'finished'
-    restore_branch = ARGV.shift # optional
+    restore_branch_override = ARGV.shift # optional
     temp_branch_override = ARGV.shift # optional
-    review_finished(restore_branch, temp_branch_override)
+    review_finished(restore_branch_override, temp_branch_override)
   when 'help'
     print_help
   else
