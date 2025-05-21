@@ -17,12 +17,12 @@ DEFAULT_CONFIG_PATH = File.join(SCRIPT_DIR, '.codereview.config.default')
 OVERRIDE_CONFIG_PATH = File.join(SCRIPT_DIR, '.codereview.config')
 
 REPO_DETAILS = {
-  platform: nil,            # :github or :gitlab
-  host: nil,                # Actual hostname from URL
-  api_base_url: nil,        # e.g. https://api.github.com or https://gitlab.com/api/v4
-  repo_path: nil,           # Path part of the repo, e.g., "owner/project" or "group/subgroup/project"
-  project_name: nil,        # The last part of the repo_path, e.g., "project"
-  owner_or_group: nil       # "owner" for GitHub, "group/subgroup" for GitLab
+  platform: nil, # :github or :gitlab
+  host: nil, # Actual hostname from URL
+  api_base_url: nil, # e.g. https://api.github.com or https://gitlab.com/api/v4
+  repo_path: nil, # Path part of the repo, e.g., "owner/project" or "group/subgroup/project"
+  project_name: nil, # The last part of the repo_path, e.g., "project"
+  owner_or_group: nil # "owner" for GitHub, "group/subgroup" for GitLab
 }
 
 # --- Logging ---
@@ -100,7 +100,7 @@ def load_configuration
   CONFIG['DEFAULT_TARGET_BRANCH'] = 'master' if CONFIG['DEFAULT_TARGET_BRANCH'].to_s.empty?
   CONFIG['DEFAULT_TEMP_BRANCH'] = 'review' if CONFIG['DEFAULT_TEMP_BRANCH'].to_s.empty?
 
-  expand_config_path_if_present(CONFIG,'SCRATCH_DIR')
+  expand_config_path_if_present(CONFIG, 'SCRATCH_DIR')
   CONFIG['SCRATCH_DIR'] = File.join(ENV['HOME'], '.tmp', 'codereview') if CONFIG['SCRATCH_DIR'].to_s.empty?
 end
 
@@ -117,6 +117,7 @@ end
 
 # Memoization for git object
 @git_object = nil
+
 def g
   @git_object ||= Git.open(Dir.pwd) # Assumes running from within the repo
 rescue ArgumentError => e
@@ -175,7 +176,6 @@ def get_platform_and_repo_details
   debug "Platform detection: #{REPO_DETAILS.inspect}"
 end
 
-
 REPO_DETAILS_LEGACY = {} # To store owner and project for bash script compatibility
 def get_repo_owner_and_name_legacy_compat
   return if REPO_DETAILS_LEGACY[:owner] && REPO_DETAILS_LEGACY[:project]
@@ -197,7 +197,6 @@ def get_repo_owner_and_name_legacy_compat
   debug "get_repo_owner_and_name_legacy_compat: OWNER=#{REPO_DETAILS_LEGACY[:owner]}, PROJECT=#{REPO_DETAILS_LEGACY[:project]}"
 end
 
-
 def get_project_base_dir_name
   return REPO_DETAILS[:project_base_dir_name] if REPO_DETAILS[:project_base_dir_name]
   begin
@@ -214,7 +213,7 @@ def get_branch_info(branch_name)
   branch_info = { 'branch' => branch_name }
   begin
     tracking_ref = g.config("branch.#{branch_name}.merge")
-    remote_name  = g.config("branch.#{branch_name}.remote")
+    remote_name = g.config("branch.#{branch_name}.remote")
 
     if (tracking_ref.nil? || tracking_ref.empty?) && (remote_name.nil? || remote_name.empty?)
       debug "get_branch_info: No local tracking info for '#{branch_name}'. Assuming 'origin' and fetching 'origin #{branch_name}'."
@@ -244,6 +243,7 @@ def get_current_branch_name
 end
 
 CR_DATA_DETAILS = {}
+
 def get_branch_data_dir_and_file(scratch_dir_base)
   return if CR_DATA_DETAILS[:file_path]
 
@@ -260,7 +260,6 @@ def get_branch_data_dir_and_file(scratch_dir_base)
   info "get_branch_data_dir_and_file: PROJECT_FOR_DIR=#{project_identifier_for_file}, CR_DATA_DIR=#{CR_DATA_DETAILS[:dir_path]}, CR_DATA_FILE=#{CR_DATA_DETAILS[:file_path]}"
   debug "get_branch_data_dir_and_file: CR_DATA_FILE=#{CR_DATA_DETAILS[:file_path]}"
 end
-
 
 def store_current_branch_name(scratch_dir_base = CONFIG['SCRATCH_DIR'])
   get_branch_data_dir_and_file(scratch_dir_base)
@@ -316,7 +315,7 @@ end
 def review_branch(feature_branch, target_branch = nil, temp_branch = nil)
   fail_with_msg "review_branch: must specify branch to review (FEATURE_BRANCH)" if feature_branch.nil? || feature_branch.empty?
   target_branch ||= CONFIG['DEFAULT_TARGET_BRANCH']
-  temp_branch   ||= CONFIG['DEFAULT_TEMP_BRANCH']
+  temp_branch ||= CONFIG['DEFAULT_TEMP_BRANCH']
   debug "review_branch: FEATURE_BRANCH=#{feature_branch}, TARGET_BRANCH=#{target_branch}, TEMP_BRANCH=#{temp_branch}"
   confirm_action
   store_current_branch_name(CONFIG['SCRATCH_DIR'])
@@ -395,23 +394,111 @@ def review_branch(feature_branch, target_branch = nil, temp_branch = nil)
   output "             #{File.join(SCRIPT_DIR, File.basename($0))} finished\n"
 end
 
+# Attempts to ensure gh CLI is authenticated for the target GitHub host.
+# Returns true if authentication is confirmed, false otherwise.
+# The script will proceed even if this returns false, letting gh commands fail naturally.
+# We expect the failure message to be informative enough to indicate the cause.
+#
+# This function is intended to be called from review_pr_gh.
+#
+def ensure_gh_authentication
+  # This function assumes get_platform_and_repo_details has been called
+  # and REPO_DETAILS is populated.
+  unless REPO_DETAILS[:platform] == :github
+    debug("ensure_gh_authentication: Not a GitHub platform, skipping gh auth check.")
+    return false # Not applicable
+  end
+
+  host = REPO_DETAILS[:host]
+  fail_with_msg("ensure_gh_authentication: Host not found in REPO_DETAILS.") if host.nil? || host.empty?
+
+  # Determine the --hostname argument for gh CLI commands
+  # No --hostname arg for github.com, explicit for GHE
+  gh_host_cli_arg = host.casecmp('github.com').zero? ? '' : "--hostname \"#{host}\""
+
+  # 1. Check current gh auth status for the specific host
+  output "Checking gh auth status for host '#{host}'..."
+  status_cmd = "gh auth status #{gh_host_cli_arg}".strip
+  stdout_status, stderr_status, status_check = Open3.capture3(status_cmd)
+
+  if status_check.success? && stdout_status.match?(/✓ Logged in to #{Regexp.escape(host)}/i)
+    info "gh auth: Already logged in to '#{host}'."
+    return true
+  else
+    info "gh auth: Not currently logged in to '#{host}' (or status check failed). Will attempt to log in."
+    debug "gh auth status output (stdout): #{stdout_status.strip}" unless stdout_status.empty?
+    debug "gh auth status output (stderr): #{stderr_status.strip}" unless stderr_status.empty?
+  end
+
+  # Helper lambda to attempt login and re-check status
+  attempt_login_and_recheck = lambda do |token_source_info, token_to_try|
+    output "Attempting gh auth login for '#{host}' using token from #{token_source_info}..."
+    login_cmd = "gh auth login #{gh_host_cli_arg} --with-token".strip
+    # Pipe the token to gh auth login's stdin
+    _stdout_login, stderr_login, login_status = Open3.capture3(login_cmd, stdin_data: token_to_try)
+
+    if login_status.success?
+      # Login command itself succeeded, now verify by re-checking status
+      info "gh auth login command successful with token from #{token_source_info} for '#{host}'. Re-checking status..."
+      verify_status_cmd = "gh auth status #{gh_host_cli_arg}".strip
+      stdout_recheck, stderr_recheck, recheck_status = Open3.capture3(verify_status_cmd)
+
+      if recheck_status.success? && stdout_recheck.match?(/✓ Logged in to #{Regexp.escape(host)}/i)
+        info "gh auth: Confirmed login to '#{host}' via #{token_source_info}."
+        return true # Successfully authenticated and confirmed
+      else
+        info "gh auth: Login command with token from #{token_source_info} succeeded, but status re-check did not confirm login for '#{host}'."
+        debug "gh auth status re-check (stdout): #{stdout_recheck.strip}" unless stdout_recheck.empty?
+        debug "gh auth status re-check (stderr): #{stderr_recheck.strip}" unless stderr_recheck.empty?
+        # Even if re-check is ambiguous, if `gh auth login` succeeded, gh might work.
+        # Per user spec "proceed anyway", but a successful login *command* is a strong positive signal.
+        # Let's consider the login command success as sufficient to stop trying other methods.
+        return :attempted_login_command_succeeded # A distinct truthy value
+      end
+    else
+      info "gh auth login with token from #{token_source_info} failed for '#{host}'. STDERR: #{stderr_login.strip}"
+      return false
+    end
+  end
+
+  # 2. Try script-specific token file
+  token_file = CONFIG['GH_TOKEN_FILE']
+  if File.exist?(token_file) && File.readable?(token_file)
+    token = File.read(token_file).strip
+    if !token.empty?
+      login_attempt_result = attempt_login_and_recheck.call("script token file (#{token_file})", token)
+      return true if login_attempt_result == true # Confirmed
+      # If login command succeeded but confirmation was ambiguous, we stop trying other methods and proceed.
+      return true if login_attempt_result == :attempted_login_command_succeeded
+    else
+      info "Token file '#{token_file}' is empty."
+    end
+  else
+    info "Script-specific token file '#{token_file}' not found or not readable."
+  end
+
+  # 3. Try environment variables (GH_TOKEN, then GITHUB_TOKEN)
+  env_vars_to_check = %w[GH_TOKEN GITHUB_TOKEN]
+  env_vars_to_check.each do |var_name|
+    token_value = ENV[var_name]
+    if token_value && !token_value.empty?
+      login_attempt_result = attempt_login_and_recheck.call("environment variable #{var_name}", token_value)
+      return true if login_attempt_result == true # Confirmed
+      return true if login_attempt_result == :attempted_login_command_succeeded # Login command ok, proceed
+    end
+  end
+
+  # 4. If all attempts failed or were skipped
+  info "gh auth: Could not confirm or establish active login for '#{host}'. Subsequent 'gh' commands may fail."
+  false # Indicate authentication was not actively confirmed by this function
+end
+
 def review_pr_gh(pr_num)
   # Ensure REPO_DETAILS is populated for GitHub
   fail_with_msg "Not a GitHub repository according to origin URL." unless REPO_DETAILS[:platform] == :github
 
-  gh_host_for_cli = REPO_DETAILS[:host] == 'github.com' ? '' : "--hostname \"#{REPO_DETAILS[:host]}\""
-  token_file = CONFIG['GH_TOKEN_FILE']
-  fail_with_msg "GitHub token file not found: #{token_file}" unless File.exist?(token_file)
-
-  output "Authenticating with gh CLI for host '#{REPO_DETAILS[:host]}'..."
-  # TODO: Use gh auth status
-  # `gh auth login` can be interactive or error if already logged in.
-  # Consider `gh auth status` or just letting `gh pr view` use existing auth / env vars.
-  # Forcing login with token might be too intrusive if gh is already configured.
-  # Let's rely on gh being pre-configured or `GH_TOKEN` env var.
-  # system_must_succeed("gh auth login #{gh_host_for_cli} --with-token < \"#{token_file}\"", show_output: false)
-  info "Assuming 'gh' CLI is authenticated or GH_TOKEN is set. Using token file for reference: #{token_file}"
-
+  ensure_gh_authentication
+  
   output "Fetching PR info from GitHub API via gh CLI for PR ##{pr_num}..."
   api_command = "gh pr view #{pr_num} --json baseRefName,headRefName --repo \"#{REPO_DETAILS[:repo_path]}\""
   api_result_json, stderr_str, status = Open3.capture3(api_command)
@@ -449,8 +536,8 @@ def review_pr_gl(mr_iid)
 
   begin
     Gitlab.configure do |config|
-      config.endpoint       = REPO_DETAILS[:api_base_url] # From get_platform_and_repo_details
-      config.private_token  = private_token
+      config.endpoint = REPO_DETAILS[:api_base_url] # From get_platform_and_repo_details
+      config.private_token = private_token
     end
     debug "GitLab client configured for endpoint: #{Gitlab.endpoint}"
 
