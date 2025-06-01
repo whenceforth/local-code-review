@@ -1,14 +1,25 @@
 #!/usr/bin/env ruby
 
-require 'bundler/setup'
+require 'bundler/setup' # loads all of Bundler—including Definition
+require 'bundler' # still a good idea to pull in the module
 
 require 'fileutils'
+require 'git'
 require 'json'
 require 'open3' # For capturing stderr from system calls if needed
+require 'pathname'
 
+# 1. Point at your Gemfile and Gemfile.lock directly:
 
-# Check Bundler group
-if Bundler.locked_gems.specs.any? { |s| s.groups.include?(:gitlab_support) && s.name == 'gitlab' }
+script_dir = __dir__
+gemfile_path = File.join(script_dir, "Gemfile")
+lockfile_path = File.join(script_dir, "Gemfile.lock")
+
+# 2. Build a Bundler::Definition so you can inspect declared groups + names:
+definition = Bundler::Definition.build(gemfile_path, lockfile_path, nil)
+
+# 3. Check “is there a dependency named 'gitlab' in the :gitlab_support group?”
+if definition.dependencies.any? { |dep| dep.name == 'gitlab' && dep.groups.include?(:gitlab_support) }
   begin
     require 'gitlab'
     puts "GitLab gem is available via Bundler group :gitlab_support."
@@ -37,11 +48,11 @@ REPO_DETAILS = {
 
 # --- Logging ---
 def debug(message)
-  puts "CR.DEBUG #{message}" if CONFIG['CR_LOG_DEBUG'] == '1' || CONFIG['CR_LOG_INFO'] == '1'
+  puts "CR.DEBUG #{message}" if CONFIG['CR_LOG_DEBUG'] == '1'
 end
 
 def info(message)
-  puts "CR.INFO  #{message}" if CONFIG['CR_LOG_INFO'] == '1'
+  puts "CR.INFO  #{message}" if CONFIG['CR_LOG_DEBUG'] == '1' || CONFIG['CR_LOG_INFO'] == '1'
 end
 
 def output(message)
@@ -144,6 +155,16 @@ def get_platform_and_repo_details
     fail_with_msg "Could not get URL for remote 'origin'. Ensure 'origin' remote is configured."
   end
 
+  if origin_url.nil?
+    REPO_DETAILS[:host] = :file
+    REPO_DETAILS[:project_name] = Pathname.new(__dir__).basename.to_s
+    # REPO_DETAILS[:repo_path] = nil
+    REPO_DETAILS[:platform] = :none
+    # REPO_DETAILS[:api_base_url] = nil
+    # REPO_DETAILS[:owner_or_group] = nil
+    return
+  end
+
   repo_host = nil
   repo_path_match = nil
 
@@ -222,8 +243,30 @@ end
 def get_branch_info(branch_name)
   branch_info = { 'branch' => branch_name }
   begin
-    tracking_ref = g.config("branch.#{branch_name}.merge")
-    remote_name = g.config("branch.#{branch_name}.remote")
+
+    begin
+      tracking_ref = g.config("branch.#{branch_name}.merge")
+    rescue Git::Error => e
+      debug "get_branch_info: Could not get remote for branch #{branch_name}: #{e.message}"
+      # assume local only repo
+      branch_info['tracking'] = tracking_ref
+      branch_info['remote'] = :none
+      branch_info['remote_url'] = :none
+      info "get_branch_info results for local-only branch: #{branch_info.inspect}"
+      return branch_info
+      # fail_with_msg "Could not get tracking ref for branch #{branch_name}.\n\n  #{e}. \n\nPlease ensure the branch exists and is checked out."
+    end
+    begin
+      remote_name = g.config("branch.#{branch_name}.remote")
+    rescue Git::Error => e
+      # debug "get_branch_info: Could not get remote for branch #{branch_name}: #{e.message}"
+      # # assume local only repo
+      # branch_info['tracking'] = tracking_ref
+      # branch_info['remote'] = :none
+      # branch_info['remote_url'] = :none
+      # info "get_branch_info results for local-only branch: #{branch_info.inspect}"
+      # return branch_info
+    end
 
     if (tracking_ref.nil? || tracking_ref.empty?) && (remote_name.nil? || remote_name.empty?)
       debug "get_branch_info: No local tracking info for '#{branch_name}'. Assuming 'origin' and fetching 'origin #{branch_name}'."
@@ -334,7 +377,10 @@ def review_branch(feature_branch, target_branch = nil, temp_branch = nil)
     status = g.status
     has_changes = status.changed.any? || status.added.any? || status.deleted.any? || status.untracked.any?
     if has_changes
-      g.stash_save("codereview_autostash_#{Time.now.to_i}")
+      msg = "codereview_autostash_#{Time.now.to_i}"
+      stash = Git::Stash.new(g, msg)
+      stash.save
+      raise "Failed save stash #{msg}" unless stash.saved?
       info "Stashed local changes."
     else
       info "No local changes to stash."
@@ -348,22 +394,29 @@ def review_branch(feature_branch, target_branch = nil, temp_branch = nil)
 
   target_branch_info = get_branch_info(target_branch)
   target_remote = target_branch_info['remote'] || 'origin'
-  info "Fetching remote '#{target_remote}' for TARGET_BRANCH=#{target_branch}"
-  system_must_succeed("git fetch #{target_remote} #{target_branch}")
+  unless target_remote == :none
+    info "Fetching remote '#{target_remote}' for TARGET_BRANCH=#{target_branch}"
+    system_must_succeed("git fetch #{target_remote} #{target_branch}")
+  end
   info "Checking out TARGET_BRANCH=#{target_branch}"
   g.checkout(target_branch)
-  info "Pulling remote '#{target_remote}' for TARGET_BRANCH=#{target_branch}"
-  system_must_succeed("git pull #{target_remote} #{target_branch}")
+  unless target_remote == :none
+    info "Pulling remote '#{target_remote}' for TARGET_BRANCH=#{target_branch}"
+    system_must_succeed("git pull #{target_remote} #{target_branch}")
+  end
 
   feature_branch_info = get_branch_info(feature_branch)
   feature_remote = feature_branch_info['remote'] || 'origin'
-  info "Fetching remote '#{feature_remote}' for FEATURE_BRANCH=#{feature_branch}"
-  system_must_succeed("git fetch #{feature_remote} #{feature_branch}")
+  unless feature_remote == :none
+    info "Fetching remote '#{feature_remote}' for FEATURE_BRANCH=#{feature_branch}"
+    system_must_succeed("git fetch #{feature_remote} #{feature_branch}")
+  end
   info "Checking out FEATURE_BRANCH=#{feature_branch}"
   g.checkout(feature_branch)
-  info "Pulling remote '#{feature_remote}' for FEATURE_BRANCH=#{feature_branch}"
-  system_must_succeed("git pull #{feature_remote} #{feature_branch}")
-
+  unless feature_remote == :none
+    info "Pulling remote '#{feature_remote}' for FEATURE_BRANCH=#{feature_branch}"
+    system_must_succeed("git pull #{feature_remote} #{feature_branch}")
+  end
   info "Checking out TARGET_BRANCH=#{target_branch} again to create temp branch"
   g.checkout(target_branch)
 
@@ -622,14 +675,18 @@ def review_finished(restore_branch_override = nil, temp_branch_override = nil)
   restore_branch_info = get_branch_info(restore_branch)
   restore_remote = restore_branch_info['remote'] || 'origin'
 
-  info "Fetching remote '#{restore_remote}' for RESTORE_BRANCH=#{restore_branch}"
-  system_must_succeed("git fetch #{restore_remote} #{restore_branch}")
+  unless restore_remote == :none
+    info "Fetching remote '#{restore_remote}' for RESTORE_BRANCH=#{restore_branch}"
+    system_must_succeed("git fetch #{restore_remote} #{restore_branch}")
+  end
 
   info "Checking out RESTORE_BRANCH=#{restore_branch}"
   g.checkout(restore_branch)
 
-  info "Pulling remote '#{restore_remote}' for RESTORE_BRANCH=#{restore_branch}"
-  system_must_succeed("git pull #{restore_remote} #{restore_branch}")
+  unless restore_remote == :none
+    info "Pulling remote '#{restore_remote}' for RESTORE_BRANCH=#{restore_branch}"
+    system_must_succeed("git pull #{restore_remote} #{restore_branch}")
+  end
 
   begin
     latest_stash = g.stashes.latest
